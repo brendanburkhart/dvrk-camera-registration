@@ -144,12 +144,14 @@ class ArUcoTarget:
 
 class BlobTracker:
     class Parameters:
-        def __init__(self, tracking_distance=15, history_length=200):
-            self.tracking_distance=15
-            self.history_length=200
+        def __init__(self, tracking_distance=15, max_history_length=200, point_history_length=5):
+            self.tracking_distance=tracking_distance
+            self.max_history_length=max_history_length
+            self.point_history_length=point_history_length
     
     def __init__(self, camera_calibration=None, parameters=Parameters(), window_title="CV Calibration"):
-        self.objects = ObjectTracking(parameters.tracking_distance, parameters.history_length)
+        self.parameters = parameters
+        self.objects = ObjectTracking(parameters.tracking_distance, parameters.max_history_length)
         self.window_title = window_title
         self.camera_calibration = camera_calibration
         self.robot_axes = None
@@ -175,6 +177,7 @@ class BlobTracker:
 
         if not ok:
             print("\n\nFailed to read from camera.")
+            return False
         
         if self.camera_calibration is not None:
             self.camera_calibration.configure_image_size(frame.shape)
@@ -252,7 +255,6 @@ class BlobTracker:
 
     def display_points_2d(self, points, color):
         self.points.append((points, color))
-        print(self.points)
 
     def draw_points(self, frame):
         for points, color in self.points:
@@ -319,7 +321,7 @@ class BlobTracker:
             cv2.circle(frame, target.position, radius=3, color=(0, 0, 255), thickness=cv2.FILLED)
             # once at least 5 data points have been collected since user selected target,
             # output average location of target
-            if len(target.location_history) > 5:
+            if len(target.location_history) > self.parameters.point_history_length:
                 mean = np.mean(target.location_history, axis=0)
                 self._acquired_point = np.int32(mean)
 
