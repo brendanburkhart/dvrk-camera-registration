@@ -14,7 +14,9 @@
 # --- end cisst license ---
 
 import argparse
+import cv2
 import dvrk
+import json
 import math
 import numpy as np
 import os
@@ -25,6 +27,7 @@ import xml.etree.ElementTree as ET
 
 import blob_tracking
 from camera_calibration import CameraCalibration
+import direct_linear_transformation as DLT
 
 class CameraRegistrationApplication:
     def configure(self, robot_name, config_file, expected_interval):
@@ -91,7 +94,7 @@ class CameraRegistrationApplication:
     # Generate arm poses to registration
     # Yields points on cube grid, where cube has side length 'side',
     # cube is shifted down by 'depth', and cube has count x count x count points
-    def registration_poses(self, size, depth, count=3):
+    def registration_poses(self, size, depth, count=4):
         cube_points = size/(count-1)*np.mgrid[0:count, 0:count, 0:count].T.reshape(-1, 3) + np.array([-0.5*size, -0.5*size, -depth])
     
         # Jaw opening facing straight down, joint 5 axis pointing forward
@@ -112,27 +115,37 @@ class CameraRegistrationApplication:
         if not ok:
             return False
 
+        target_shift = np.array([0, 0, -0.04])
+
         try:
             # Slow down arm so blob tracker doesn't lose target
             self.arm.trajectory_j_set_ratio(0.2)
 
             object_points = []
             image_points = []
+
+            print("Collecting data: 0% complete", end='\r')
    
             # Move arm to variety of positions and record image & world coordinates 
             poses = self.registration_poses(size, depth)
-            for pose in poses:
+            for i, pose in enumerate(poses):
                 if not self.ok:
                     self.center_arm()
                     break
 
                 self.arm.move_cp(pose).wait()
                 
-                position = self.arm.measured_cp().p
-                object_points.append(np.array([position[0], position[1], position[2]]))
-                
                 self.ok, image_point = self.tracker.acquire_point()
                 image_points.append(image_point)
+                
+                position = self.arm.measured_cp().p
+                position = np.array([position[0], position[1], position[2]])
+                object_points.append(position + target_shift)
+                
+                progress = float(i+1)/(4**3)
+                print("Collecting data: {}% complete".format(100.0*progress), end='\r')
+
+            print("\n")
 
         finally:
             # Restore normal arm speed
@@ -145,7 +158,6 @@ class CameraRegistrationApplication:
         object_points = np.array(object_points, dtype=np.float32)
         image_points = np.array(image_points, dtype=np.float32)
         ok, rvec, tvec = self.camera_calibration.get_pose(object_points, image_points)
-        print(ok)
         angle = np.linalg.norm(rvec)
         dist = np.linalg.norm(tvec)
         self.tracker.set_robot_axes(rvec, tvec)
@@ -158,19 +170,35 @@ class CameraRegistrationApplication:
         print("Axes: {}, {}".format(rotation_axis, translation_axis))
         print("Axis alignment: {}".format(abs(np.dot(rotation_axis, translation_axis))))
         print()
-        
+
         self.done = False
         print("Press enter or 'd' to continue")
         while not self.done and self.ok:
             rospy.sleep(0.25)
        
-        return rvec, tvec
+        return self.ok, rvec, tvec
+
+    def save_registration(self, rvec, tvec, file_name):
+        rotation_matrix, _ = cv2.Rodrigues(rvec)
+
+        # Correct OpenCV y-axis convention?
+
+        world_to_camera = np.zeros((4, 4))
+        world_to_camera[0:3, 0:3] = rotation_matrix
+        world_to_camera[0:3, 3:4] = tvec
+        world_to_camera[3, 3] = 1.0
+        
+        base_frame = { "reference-frame": "camera", "transform": world_to_camera.tolist() }
+
+        with open(file_name, 'w') as f:
+            json.dump(base_frame, f)
+            f.write("\n")
 
     # Exit key (q/ESCAPE) handler for GUI
     def _on_quit(self):
         self.ok = False
         self.tracker.stop()
-        print("Exiting...")
+        print("\nExiting...")
 
     # Enter (or 'd') handler for GUI
     def _on_enter(self):
@@ -186,14 +214,23 @@ class CameraRegistrationApplication:
     def run(self):
         try:
             self.ok = True
-            
-            self.tracker = blob_tracking.BlobTracker(self.camera_calibration)
-            self.tracker.start(self._on_enter, self._on_quit)
+           
+            tracking_parameters = blob_tracking.BlobTracker.Parameters(point_history_length=10) 
+            self.tracker = blob_tracking.BlobTracker(self.camera_calibration, tracking_parameters)
+            self.ok = self.tracker.start(self._on_enter, self._on_quit)
+            if not self.ok:
+                return
 
             self.home()
             data = self.collect_data(0.1, 0.2)
-            if self.ok:
-                registration = self.compute_registration(*data)
+            if not self.ok:
+                return
+
+            ok, rvec, tvec = self.compute_registration(*data)
+            if not ok:
+                return
+            
+            self.save_registration(rvec, tvec, "./camera_registration.json")
 
         finally:
             self.tracker.stop()

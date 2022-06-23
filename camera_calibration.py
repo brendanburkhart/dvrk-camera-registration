@@ -52,7 +52,7 @@ class CameraCalibration:
         return image_points
 
     def get_pose(self, object_points, image_points):
-        return cv2.solvePnP(object_points, image_points, self.camera_matrix, self.distortion_coef)
+        return cv2.solvePnP(object_points, image_points, self.new_camera_matrix, self.no_distortion)
         
 
 class CalibrationApplication:
