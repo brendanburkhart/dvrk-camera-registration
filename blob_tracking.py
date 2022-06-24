@@ -218,28 +218,24 @@ class BlobTracker:
             cv2.drawContours(frame, [contours[i]], -1, color, 3)
 
     def _process_aruco(self, frame):
-        try:
-            def detection(corners):
-                center = np.int0(np.mean(corners, axis=0))
-                size = math.sqrt(cv2.contourArea(corners)) 
-                return (center[0], center[1], size)
+        def detection(corners):
+            center = np.int0(np.mean(corners, axis=0))
+            size = math.sqrt(cv2.contourArea(corners))
+            return (center[0], center[1], size)
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            parameters = cv2.aruco.DetectorParameters_create()
-            arucoDict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, arucoDict, parameters=parameters)
-            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        parameters = cv2.aruco.DetectorParameters_create()
+        arucoDict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, arucoDict, parameters=parameters)
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            corners = [c[0] for c in corners]
-            ids = [x[0] for x in ids]
+        corners = [c[0] for c in corners]
+        ids = [x[0] for x in ids] if ids is not None else []
 
-            aruco_id = 0
-            corners = [corners[i] for i in range(len(ids)) if ids[i] == aruco_id]
-            detections = [detection(c) for c in corners]
-            self.objects.register(detections)
-
-        except:
-            return
+        aruco_id = 0
+        corners = [corners[i] for i in range(len(ids)) if ids[i] == aruco_id]
+        detections = [detection(c) for c in corners]
+        self.objects.register(detections)
 
     def clear_history(self):
         self.objects.clear_history()
