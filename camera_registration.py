@@ -95,22 +95,23 @@ class CameraRegistrationApplication:
     # Yields points on cube grid, where cube has side length 'side',
     # cube is shifted down by 'depth', and cube has count x count x count points
     def registration_poses(self, size, depth, count=4):
-        cube_points = size/(count-1)*np.mgrid[0:count, 0:count, 0:count].T.reshape(-1, 3) + np.array([-0.5*size, -0.5*size, -depth])
+        offset = np.array([-0.5*size, -0.5*size, -depth])
+        scale = size/(count - 1)
+        cube_points = np.mgrid[0:count, 0:count, 0:count].T.reshape(-1, 3)
+        cube_points = scale*cube_points + offset
     
         # Jaw opening facing straight down, joint 5 axis pointing forward
-        goal_orientation = PyKDL.Rotation()
-        goal_orientation[1,1] = -1.0
-        goal_orientation[2,2] = -1.0
+        goal_rotation = PyKDL.Rotation()
+        goal_rotation[1,1] = -1.0
+        goal_rotation[2,2] = -1.0
  
-        pose = self.arm.measured_cp()
-        pose.M = goal_orientation
+        cube_points = [PyKDL.Vector(*cube_points[i, :]) for i in range(count**3)]
+        poses = [PyKDL.Frame(goal_rotation, p) for p in cube_points]
 
-        for i in range(count**3):
-            position = PyKDL.Vector(*cube_points[i, :])
-            pose.p = position
-            yield pose
+        return poses
 
-    def collect_data(self, size, depth):
+    # move arm to each goal pose, and measure both robot and camera relative positions
+    def collect_data(self, poses):
         ok = self.enter_cartesian_space()
         if not ok:
             return False
@@ -127,7 +128,6 @@ class CameraRegistrationApplication:
             print("Collecting data: 0% complete", end='\r')
    
             # Move arm to variety of positions and record image & world coordinates 
-            poses = self.registration_poses(size, depth)
             for i, pose in enumerate(poses):
                 if not self.ok:
                     self.center_arm()
@@ -142,8 +142,8 @@ class CameraRegistrationApplication:
                 position = np.array([position[0], position[1], position[2]])
                 object_points.append(position + target_shift)
                 
-                progress = float(i+1)/(4**3)
-                print("Collecting data: {}% complete".format(100.0*progress), end='\r')
+                progress = (i+1)/len(poses)
+                print("Collecting data: {}% complete".format(int(100*progress)), end='\r')
 
             print("\n")
 
@@ -222,7 +222,9 @@ class CameraRegistrationApplication:
                 return
 
             self.home()
-            data = self.collect_data(0.1, 0.2)
+
+            poses = self.registration_poses(0.1, 0.2, 3)
+            data = self.collect_data(poses)
             if not self.ok:
                 return
 
