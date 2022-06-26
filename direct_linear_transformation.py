@@ -1,6 +1,7 @@
 import math
 import numpy as np
 
+
 class DirectLinearTransformation:
     def __init__(self, dimension):
         self.dimension = dimension
@@ -8,7 +9,7 @@ class DirectLinearTransformation:
         self.hspace_basis = DirectLinearTransformation._gen_hspace_basis(self.dimension)
 
     def _gen_hspace_basis(size):
-        dimension = int(size*(size-1)/2)
+        dimension = int(size * (size - 1) / 2)
         basis = []
 
         x, y = (0, 1)
@@ -27,30 +28,31 @@ class DirectLinearTransformation:
         return basis
 
     def _flatten(self, M):
-        return M.flatten('F')
+        return M.flatten("F")
 
     def _unflatten(self, v):
-        return np.reshape(v, (self.dimension, self.dimension+1), 'F')
+        return np.reshape(v, (self.dimension, self.dimension + 1), "F")
 
     def compute(self, x, y):
         n, d = x.shape
         assert d == self.dimension
-        assert (n, d+1) == y.shape
-        
+        assert (n, d + 1) == y.shape
+
         h = len(self.hspace_basis)
-        B = np.zeros((n * h, self.dimension*(self.dimension+1)))
+        B = np.zeros((n * h, self.dimension * (self.dimension + 1)))
 
         for i in range(n):
             for j in range(h):
                 H = self.hspace_basis[j]
-                xH = np.matmul(np.transpose(x[i]), H).reshape(1,-1)
-                r = np.matmul(np.transpose(xH), y[i].reshape(1,-1))
-                B[i*h + j, :] = self._flatten(r)
+                xH = np.matmul(np.transpose(x[i]), H).reshape(1, -1)
+                r = np.matmul(np.transpose(xH), y[i].reshape(1, -1))
+                B[i * h + j, :] = self._flatten(r)
 
         u, s, vh = np.linalg.svd(B)
-        a = vh[len(s)-1, :]
+        a = vh[len(s) - 1, :]
         A = self._unflatten(a)
         return A
+
 
 class CameraMatrix:
     def __init__(self, transformation):
@@ -83,9 +85,9 @@ class CameraRegistration:
         # scale so that rotation submatrix is a rotation, i.e. has determinant 1
         rotation = transformation[0:3, 0:3]
         det = np.linalg.det(rotation)
-        scale = math.copysign(math.pow(1.0/math.fabs(det), 1/3), det)
-        transformation = scale*transformation
-        
+        scale = math.copysign(math.pow(1.0 / math.fabs(det), 1 / 3), det)
+        transformation = scale * transformation
+
         # add homogeneous-preserving row to create square matrix
         # not really necessary since we already have rotation + translation
         # but its nice to have camera matrix in standard form

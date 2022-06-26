@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Author: Brendan Burkhart 
+# Author: Brendan Burkhart
 # Date: 2022-06-21
 
 # (C) Copyright 2022 Johns Hopkins University (JHU), All Rights Reserved.
@@ -29,7 +29,7 @@ class TrackedObject:
         self.position = (detection[0], detection[1])
         self.size = detection[2]
 
-        # 'signal-strength' i.e. how long and consistently this object has been detected for
+        # 'signal-strength' of this detection
         self.strength = 1
 
         # queue will 'remember' last history_length object locations
@@ -37,10 +37,10 @@ class TrackedObject:
         self.location_history.append(self.position)
 
     # Manhattan/L1 distance between this object and 'position'
-    def distanceTo(self, position):
+    def distance_to(self, position):
         dx = self.position[0] - position[0]
         dy = self.position[1] - position[1]
-        return math.sqrt(dx*dx + dy*dy)
+        return math.sqrt(dx * dx + dy * dy)
 
     def is_strong(self):
         return self.strength > (TrackedObject.max_strength - 2)
@@ -54,7 +54,7 @@ class TrackedObject:
             self.location_history.append(self.position)
 
             # cap strength so objects never remain too long
-            self.strength = min(self.strength+1, TrackedObject.max_strength)
+            self.strength = min(self.strength + 1, TrackedObject.max_strength)
         else:
             self.strength -= 2
 
@@ -71,8 +71,10 @@ class ObjectTracking:
 
     # mark on object as the primary object to track
     def setPrimaryTarget(self, position):
-        nearbyObjects = [x for x in self.objects if x.distanceTo(position) < 1.35*x.size]
-        self.primaryTarget = nearbyObjects[0] if len(nearbyObjects) == 1 else None
+        is_nearby = lambda object: object.distance_to(position) < 1.35 * object.size
+        nearby_objects = [x for x in self.objects if is_nearby(x)]
+
+        self.primaryTarget = nearby_objects[0] if len(nearby_objects) == 1 else None
         if self.primaryTarget is not None:
             self.primaryTarget.location_history.clear()
 
@@ -84,45 +86,47 @@ class ObjectTracking:
     # register detections from the current frame with tracked objects,
     # removing, updating, and adding tracked objects as needed
     def register(self, detections):
-        # Matrix of minimum distance between each detection and each tracked object
-        distances = np.array([
-            np.array([obj.distanceTo(d) for d in detections])
-            for obj in self.objects
-        ])
+        # No existing tracked objects, add all detections as new objects
+        if len(self.objects) == 0:
+            for d in detections:
+                self.objects.append(TrackedObject(d, self.history_length))
 
+            return
+
+        # No detections were found
+        if len(detections) == 0:
+            for obj in self.objects:
+                obj.update(None)
+
+            return
+
+        # Matrix of minimum distance between each detection and each tracked object
+        distances = np.array(
+            [[obj.distance_to(d) for d in detections] for obj in self.objects]
+        )
+
+        # Array of closest tracked object to each detection
+        closest = np.argmin(distances, axis=0)
         current_object_count = len(self.objects)
 
-        if len(self.objects) > 0:
-            if len(detections) > 0:
-                # Array of closest tracked object to each detection
-                closest = np.argmin(distances, axis=0)
-
-                # associate detections with existing tracked objects or add as new objects
-                for i, detection in enumerate(detections):
-                    if distances[closest[i], i] <= self.max_distance:
-                        self.objects[closest[i]].update(detection)
-                    else:
-                        self.objects.append(TrackedObject(detection, history_length=self.history_length))
-
-                # Update tracked objects not associated with current detection
-                closest = np.argmin(distances, axis=1)
-                for j in range(current_object_count):
-                    if distances[j, closest[j]] > self.max_distance:
-                        self.objects[j].update(None)
+        # associate detections with existing tracked objects or add as new objects
+        for i, detection in enumerate(detections):
+            if distances[closest[i], i] <= self.max_distance:
+                self.objects[closest[i]].update(detection)
             else:
-                for obj in self.objects:
-                    obj.update(None)
+                self.objects.append(TrackedObject(detection, self.history_length))
 
-            # Remove stale tracked objects and check if primary target is stale
-            self.objects = [x for x in self.objects if x.strength > 0]
-            if not self.primaryTarget in self.objects and self.primaryTarget is not None:
-                print("Lost track of target! Please click on target to re-acquire")
-                self.primaryTarget = None
+        # Update tracked objects not associated with current detection
+        closest = np.argmin(distances, axis=1)
+        for j in range(current_object_count):
+            if distances[j, closest[j]] > self.max_distance:
+                self.objects[j].update(None)
 
-        # No existing tracked objects, add all detections as new objects
-        else:
-            for d in detections:
-                self.objects.append(TrackedObject(d, history_length=self.history_length))
+        # Remove stale tracked objects and check if primary target is stale
+        self.objects = [x for x in self.objects if x.strength > 0]
+        if not self.primaryTarget in self.objects and self.primaryTarget is not None:
+            print("Lost track of target! Please click on target to re-acquire")
+            self.primaryTarget = None
 
 
 class ColorTarget:
@@ -144,14 +148,23 @@ class ArUcoTarget:
 
 class BlobTracker:
     class Parameters:
-        def __init__(self, tracking_distance=15, max_history_length=200, point_history_length=5):
-            self.tracking_distance=tracking_distance
-            self.max_history_length=max_history_length
-            self.point_history_length=point_history_length
-    
-    def __init__(self, camera_calibration=None, parameters=Parameters(), window_title="CV Calibration"):
+        def __init__(
+            self, tracking_distance=15, max_history_length=200, point_history_length=5
+        ):
+            self.tracking_distance = tracking_distance
+            self.max_history_length = max_history_length
+            self.point_history_length = point_history_length
+
+    def __init__(
+        self,
+        camera_calibration=None,
+        parameters=Parameters(),
+        window_title="CV Calibration",
+    ):
         self.parameters = parameters
-        self.objects = ObjectTracking(parameters.tracking_distance, parameters.max_history_length)
+        self.objects = ObjectTracking(
+            parameters.tracking_distance, parameters.max_history_length
+        )
         self.window_title = window_title
         self.camera_calibration = camera_calibration
         self.robot_axes = None
@@ -165,7 +178,7 @@ class BlobTracker:
 
     def _create_window(self):
         cv2.namedWindow(self.window_title)
-        cv2.setMouseCallback(self.window_title, lambda *args: self._mouse_callback(*args))
+        cv2.setMouseCallback(self.window_title, self._mouse_callback)
 
     def _init_video(self):
         self.video_capture = cv2.VideoCapture(0)
@@ -178,7 +191,7 @@ class BlobTracker:
         if not ok:
             print("\n\nFailed to read from camera.")
             return False
-        
+
         if self.camera_calibration is not None:
             self.camera_calibration.configure_image_size(frame.shape)
 
@@ -190,9 +203,13 @@ class BlobTracker:
 
     # Process a frame - find, track, outline all potential targets
     def _process(self, frame):
-        blurred = cv2.medianBlur(frame, 2*5 + 1)
+        blurred = cv2.medianBlur(frame, 2 * 5 + 1)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        thresholded = cv2.inRange(hsv, (125, int(35*2.55), int(25*2.55)), (180, int(100*2.55), int(75*2.55)))
+        thresholded = cv2.inRange(
+            hsv,
+            (125, int(35 * 2.55), int(25 * 2.55)),
+            (180, int(100 * 2.55), int(75 * 2.55)),
+        )
 
         contours, _ = cv2.findContours(
             thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -200,11 +217,15 @@ class BlobTracker:
 
         contours = [c for c in contours if cv2.contourArea(c) > 15]
 
-        #cv2.drawContours(frame, contours, -1, (0, 255, 0), 3)
+        # cv2.drawContours(frame, contours, -1, (0, 255, 0), 3)
 
         moments = [cv2.moments(c) for c in contours]
-        radius = lambda area: math.sqrt(area/math.pi)
-        detections = [(int(M['m10']/M['m00']), int(M['m01']/M['m00']), radius(M['m00'])) for M in moments if M['m00'] > 0]
+        radius = lambda area: math.sqrt(area / math.pi)
+        detections = [
+            (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]), radius(M["m00"]))
+            for M in moments
+            if M["m00"] > 0
+        ]
 
         self.objects.register(detections)
 
@@ -212,7 +233,10 @@ class BlobTracker:
             contour_center = (detections[i][0], detections[i][1])
 
             color = (0, 255, 0)
-            if self.objects.primaryTarget is not None and self.objects.primaryTarget.position == contour_center:
+            if (
+                self.objects.primaryTarget is not None
+                and self.objects.primaryTarget.position == contour_center
+            ):
                 color = (255, 0, 255)
 
             cv2.drawContours(frame, [contours[i]], -1, color, 3)
@@ -226,7 +250,9 @@ class BlobTracker:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         parameters = cv2.aruco.DetectorParameters_create()
         arucoDict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, arucoDict, parameters=parameters)
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray, arucoDict, parameters=parameters
+        )
         cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
         corners = [c[0] for c in corners]
@@ -242,7 +268,7 @@ class BlobTracker:
 
     def set_robot_axes(self, rvec, tvec):
         scale = 0.10
-        axes = scale*np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        axes = scale * np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
         self.robot_axes = self.camera_calibration.project_points(axes, rvec, tvec)
 
     def display_points(self, points, rvec, tvec, color):
@@ -263,7 +289,7 @@ class BlobTracker:
 
         for i in range(3):
             start = tuple(np.int0(axes[0]))
-            end = tuple(np.int0(axes[i+1]))
+            end = tuple(np.int0(axes[i + 1]))
             cv2.line(frame, start, end, color, 3)
 
     # In background, run object tracking and display video
@@ -283,7 +309,11 @@ class BlobTracker:
             ok = True
             while ok and not self.should_stop:
                 ok, frame = self.video_capture.read()
-                frame = self.camera_calibration.undistort(frame) if self.camera_calibration is not None else frame
+                frame = (
+                    self.camera_calibration.undistort(frame)
+                    if self.camera_calibration is not None
+                    else frame
+                )
                 if not ok:
                     print("\n\nFailed to read from camera")
                     self._quit_handler()
@@ -297,7 +327,7 @@ class BlobTracker:
                 self.draw_points(frame)
                 cv2.imshow(self.window_title, frame)
                 key = cv2.waitKey(20)
-                key = key & 0xFF # Upper bits are modifiers (control, alt, etc.)
+                key = key & 0xFF  # Upper bits are modifiers (control, alt, etc.)
                 escape = 27
                 if key == ord("q") or key == escape:
                     self._quit_handler()
@@ -314,9 +344,16 @@ class BlobTracker:
     def _run_point_acquisition(self, frame):
         target = self.objects.primaryTarget
         if target is not None and target.is_strong():
-            cv2.circle(frame, target.position, radius=3, color=(0, 0, 255), thickness=cv2.FILLED)
-            # once at least 5 data points have been collected since user selected target,
-            # output average location of target
+            cv2.circle(
+                frame,
+                target.position,
+                radius=3,
+                color=(0, 0, 255),
+                thickness=cv2.FILLED,
+            )
+
+            # once at least 5 data points have been collected since user selected
+            # target, output average location of target
             if len(target.location_history) > self.parameters.point_history_length:
                 mean = np.mean(target.location_history, axis=0)
                 self._acquired_point = np.int32(mean)
@@ -335,4 +372,3 @@ class BlobTracker:
                 return True, self._acquired_point
 
         return False, None
-
