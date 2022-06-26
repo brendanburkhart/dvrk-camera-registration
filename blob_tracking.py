@@ -300,13 +300,10 @@ class BlobTracker:
         self._should_run_point_acquisition = False
         self._should_run_rcm_tracking = False
 
-        self._create_window()
-        ok = self._init_video()
-        if not ok:
-            return False
-
         def run_camera():
-            ok = True
+            self._create_window()
+            ok = self._init_video()
+
             while ok and not self.should_stop:
                 ok, frame = self.video_capture.read()
                 frame = (
