@@ -16,6 +16,7 @@
 import argparse
 import cv2
 import dvrk
+from geometry_msgs.msg import Pose, Point, Quaternion
 import json
 import math
 import numpy as np
@@ -65,7 +66,7 @@ class CameraRegistrationApplication:
 
         return True
 
-    def home(self):
+    def setup(self):
         print("Enabling...")
         if not self.arm.enable(10):
             print("Failed to enable within 10 seconds")
@@ -77,6 +78,15 @@ class CameraRegistrationApplication:
             return False
 
         print("Homing complete\n")
+
+        # Set base frame transformation to identity
+        identity = Pose(Point(0.0, 0.0, 0.0), Quaternion(0.0, 0.0, 0.0, 1.0))
+        base_frame_topic = "/{}/set_base_frame".format(self.arm.namespace())
+        self.set_base_frame_pub = rospy.Publisher(base_frame_topic, Pose, queue_size=1, latch=True)
+        self.set_base_frame_pub.publish(identity)
+        rospy.sleep(2.0) # Needed to base frame change to work for some reason
+        print("Base frame cleared\n")
+
         return True
 
     # instrument needs to be inserted past cannula to use Cartesian commands,
@@ -109,11 +119,9 @@ class CameraRegistrationApplication:
         cube_points = np.mgrid[0:count, 0:count, 0:count].T.reshape(-1, 3)
         cube_points = scale * cube_points + offset
 
-        # Jaw opening facing straight down, joint 5 axis pointing forward
-        goal_rotation = PyKDL.Rotation()
-        goal_rotation[1, 1] = -1.0
-        goal_rotation[2, 2] = -1.0
-
+        # Preserve current tool orientation
+        goal_rotation = self.arm.measured_cp().M
+ 
         cube_points = [PyKDL.Vector(*cube_points[i, :]) for i in range(count**3)]
         poses = [PyKDL.Frame(goal_rotation, p) for p in cube_points]
 
@@ -169,7 +177,9 @@ class CameraRegistrationApplication:
     def compute_registration(self, object_points, image_points):
         object_points = np.array(object_points, dtype=np.float32)
         image_points = np.array(image_points, dtype=np.float32)
-        ok, rvec, tvec = self.camera_calibration.get_pose(object_points, image_points)
+        ok, error, rvec, tvec = self.camera_calibration.get_pose(object_points, image_points)
+        print("Registration error: {} px".format(error))
+
         angle = np.linalg.norm(rvec)
         dist = np.linalg.norm(tvec)
         self.tracker.set_robot_axes(rvec, tvec)
@@ -199,7 +209,7 @@ class CameraRegistrationApplication:
 
         world_to_camera = np.zeros((4, 4))
         world_to_camera[0:3, 0:3] = rotation_matrix
-        world_to_camera[0:3, 3:4] = tvec
+        #world_to_camera[0:3, 3:4] = tvec
         world_to_camera[3, 3] = 1.0
 
         base_frame = {
@@ -244,9 +254,11 @@ class CameraRegistrationApplication:
             if not self.ok:
                 return
 
-            self.home()
+            self.ok = self.setup()
+            if not self.ok:
+                return
 
-            poses = self.registration_poses(0.1, 0.2, 3)
+            poses = self.registration_poses(0.1, 0.2, 4)
             data = self.collect_data(poses)
             if not self.ok:
                 return
@@ -318,3 +330,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
