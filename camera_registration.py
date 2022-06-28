@@ -17,6 +17,7 @@ import argparse
 import cv2
 import dvrk
 from geometry_msgs.msg import Pose, Point, Quaternion
+import itertools
 import json
 import math
 import numpy as np
@@ -62,6 +63,7 @@ class CameraRegistrationApplication:
                 robot_name, serial_number
             )
         )
+        self.expected_interval = expected_interval
         self.arm = dvrk.psm(arm_name=robot_name, expected_interval=expected_interval)
 
         return True
@@ -89,6 +91,42 @@ class CameraRegistrationApplication:
 
         return True
 
+    def _min_inscribed_circle(self, points):
+        hull = cv2.convexHull(points)
+        hull = hull + np.array([180, 180])
+        hull = hull.reshape((-1, 2)).astype(np.int32)
+
+        mask = np.zeros((360, 360), dtype='uint8')
+        cv2.drawContours(mask, [hull], 0, 255, cv2.FILLED)
+        distance_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5, cv2.DIST_LABEL_PIXEL)
+        _, radius, _, center = cv2.minMaxLoc(distance_map)
+
+        return (center, radius)
+
+    def determine_safe_range_of_motion(self):
+        print("Release the clutch and move the arm around to establish the area the arm can move in")
+        print("Press enter or 'd' when done")
+
+        safe_depth = 0.0
+        safe_radius = 0.0
+        self.done = False
+
+        while self.ok and not self.done:
+            pose = self.arm.measured_cp()
+            position = np.array([pose.p[0], pose.p[1], pose.p[2]])
+            depth = math.fabs(position[2]) - 0.05
+            safe_depth = max(safe_depth, depth)
+
+            r = np.linalg.norm(position)
+            alpha = math.asin(pose.p[0]/r)
+            beta = math.asin(pose.p[1]/r)
+            radius = math.sqrt(alpha**2 + beta**2)
+            safe_radius = max(safe_radius, radius)
+
+            rospy.sleep(self.expected_interval)
+
+        return self.ok, (safe_depth, safe_radius)
+
     # instrument needs to be inserted past cannula to use Cartesian commands,
     # this will move instrument if necessary so Cartesian commands can be used
     def enter_cartesian_space(self):
@@ -110,20 +148,27 @@ class CameraRegistrationApplication:
         self.arm.move_jp(pose).wait()
         return True
 
-    # Generate arm poses to registration
-    # Yields points on cube grid, where cube has side length 'side',
-    # cube is shifted down by 'depth', and cube has count x count x count points
-    def registration_poses(self, size, depth, count=4):
-        offset = np.array([-0.5 * size, -0.5 * size, -depth])
-        scale = size / (count - 1)
-        cube_points = np.mgrid[0:count, 0:count, 0:count].T.reshape(-1, 3)
-        cube_points = scale * cube_points + offset
+    # Generate series of arm poses within safe rang of motion
+    # range_of_motion = (depth, radius, center) describes a
+    #     cone with tip at RCM, base centered at (center, depth)
+    # Generates slices^3 poses total
+    def registration_poses(self, range_of_motion, slices=4):
+        points = []
+        for i, j, k in itertools.product(range(slices), range(slices), range(slices)):
+            r = range_of_motion[0]*(i+1)/slices + 0.05
+            radius = range_of_motion[1]*(j+1)/slices
+            angle = 2*math.pi*(k+1)/slices
+
+            alpha = radius*math.cos(angle)
+            beta = radius*math.sin(angle)
+            point = [r*math.sin(alpha), r*math.sin(beta), -r]
+            points.append(point)
 
         # Preserve current tool orientation
         goal_rotation = self.arm.measured_cp().M
- 
-        cube_points = [PyKDL.Vector(*cube_points[i, :]) for i in range(count**3)]
-        poses = [PyKDL.Frame(goal_rotation, p) for p in cube_points]
+
+        points = [PyKDL.Vector(p[0], p[1], p[2]) for p in points]
+        poses = [PyKDL.Frame(goal_rotation, p) for p in points]
 
         return poses
 
@@ -150,6 +195,7 @@ class CameraRegistrationApplication:
                     self.center_arm()
                     break
 
+                print(pose.p)
                 self.arm.move_cp(pose).wait()
 
                 self.ok, image_point = self.tracker.acquire_point()
@@ -258,7 +304,11 @@ class CameraRegistrationApplication:
             if not self.ok:
                 return
 
-            poses = self.registration_poses(0.1, 0.2, 4)
+            self.ok, safe_range = self.determine_safe_range_of_motion()
+            if not self.ok:
+                return
+
+            poses = self.registration_poses(safe_range, 4)
             data = self.collect_data(poses)
             if not self.ok:
                 return
