@@ -285,17 +285,18 @@ class CameraRegistrationApplication:
             self.camera_matrix, self.distortion_coefs
         )
 
+    def _init_tracking(self):
+        object_tracker = blob_tracking.ObjectTracking(15, 200)
+        target_type = blob_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
+        parameters = blob_tracking.BlobTracker.Parameters(50)
+        self.tracker = blob_tracking.BlobTracker(object_tracker, target_type, parameters, self.camera_calibration)
+
     # application entry point
     def run(self):
         try:
             self.ok = True
 
-            tracking_parameters = blob_tracking.BlobTracker.Parameters(
-                point_history_length=10
-            )
-            self.tracker = blob_tracking.BlobTracker(
-                self.camera_calibration, tracking_parameters
-            )
+            self._init_tracking()
             self.ok = self.tracker.start(self._on_enter, self._on_quit)
             if not self.ok:
                 return

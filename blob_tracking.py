@@ -22,61 +22,64 @@ import threading
 
 # Represents a single tracked detection, with location history information
 class TrackedObject:
-    max_strength = 10
-
-    def __init__(self, detection, history_length):
-        # Last known position
-        self.position = (detection[0], detection[1])
-        self.size = detection[2]
+    def __init__(self, detection, max_strength=10, max_history=200, drop_off=2):
+        self.position, self.size, self.contour = detection
 
         # 'signal-strength' of this detection
         self.strength = 1
+        self.stale = False
+        self.max_strength = max_strength
+        self.drop_off = drop_off
 
-        # queue will 'remember' last history_length object locations
-        self.location_history = collections.deque(maxlen=history_length)
+        # queue will 'remember' last max_history object locations
+        self.location_history = collections.deque(maxlen=max_history)
         self.location_history.append(self.position)
 
-    # Manhattan/L1 distance between this object and 'position'
+    # l2 distance between this object and 'position'
     def distance_to(self, position):
         dx = self.position[0] - position[0]
         dy = self.position[1] - position[1]
         return math.sqrt(dx * dx + dy * dy)
 
     def is_strong(self):
-        return self.strength > (TrackedObject.max_strength - 2)
+        return self.strength >= (self.max_strength - 2)
+
+    def is_stale(self):
+        return self.stale
 
     # when a match is found, known position is updated and strength increased by 1,
     # if no match is found, strength decays by 2 to prevent strength from oscillating
     def update(self, detection):
         if detection is not None:
-            self.position = (detection[0], detection[1])
-            self.size = detection[2]
+            self.position, self.size, self.contour = detection
             self.location_history.append(self.position)
 
             # cap strength so objects never remain too long
-            self.strength = min(self.strength + 1, TrackedObject.max_strength)
+            self.strength = min(self.strength + 1, self.max_strength)
+            self.stale = False
         else:
             self.strength -= 2
+            self.stale = True
 
 
 # Track all detected objects as they move over time
 class ObjectTracking:
     # max_distance is how far objects can move between frames
     # and still be considered the same object
-    def __init__(self, max_distance, history_length):
+    def __init__(self, max_distance, max_history):
         self.objects = []
+        self.primary_target = None
         self.max_distance = max_distance
-        self.primaryTarget = None
-        self.history_length = history_length
+        self.max_history = max_history
 
     # mark on object as the primary object to track
-    def setPrimaryTarget(self, position):
+    def set_primary_target(self, position):
         is_nearby = lambda object: object.distance_to(position) < 1.35 * object.size
         nearby_objects = [x for x in self.objects if is_nearby(x)]
 
-        self.primaryTarget = nearby_objects[0] if len(nearby_objects) == 1 else None
-        if self.primaryTarget is not None:
-            self.primaryTarget.location_history.clear()
+        self.primary_target = nearby_objects[0] if len(nearby_objects) == 1 else None
+        if self.primary_target is not None:
+            self.primary_target.location_history.clear()
 
     # Clear location history of all tracked objects
     def clear_history(self):
@@ -89,7 +92,7 @@ class ObjectTracking:
         # No existing tracked objects, add all detections as new objects
         if len(self.objects) == 0:
             for d in detections:
-                self.objects.append(TrackedObject(d, self.history_length))
+                self.objects.append(TrackedObject(d, self.max_history))
 
             return
 
@@ -114,7 +117,7 @@ class ObjectTracking:
             if distances[closest[i], i] <= self.max_distance:
                 self.objects[closest[i]].update(detection)
             else:
-                self.objects.append(TrackedObject(detection, self.history_length))
+                self.objects.append(TrackedObject(detection, self.max_history))
 
         # Update tracked objects not associated with current detection
         closest = np.argmin(distances, axis=1)
@@ -124,47 +127,84 @@ class ObjectTracking:
 
         # Remove stale tracked objects and check if primary target is stale
         self.objects = [x for x in self.objects if x.strength > 0]
-        if not self.primaryTarget in self.objects and self.primaryTarget is not None:
+        if not self.primary_target in self.objects and self.primary_target is not None:
             print("Lost track of target! Please click on target to re-acquire")
-            self.primaryTarget = None
+            self.primary_target = None
 
 
 class ColorTarget:
-    def __init__(self, min_color, max_color):
-        self.min_color = min_color
-        self.max_color = max_color
+    def __init__(self, min_color_hsv, max_color_hsv, blur_aperature, contour_min_size):
+        self.min_color = min_color_hsv
+        self.max_color = max_color_hsv
+        self.blur_aperature = blur_aperature
+        self.contour_min_size = contour_min_size
 
     def find(self, image):
-        pass
+        # Process a frame - find, track, outline all potential targets
+        blurred = cv2.medianBlur(image, 2 * self.blur_aperature + 1)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        thresholded = cv2.inRange(hsv, self.min_color, self.max_color)
+
+        contours, _ = cv2.findContours(
+            thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contours = [c for c in contours if cv2.contourArea(c) > self.contour_min_size]
+
+        moments = [cv2.moments(c) for c in contours]
+        radius = lambda area: math.sqrt(area / math.pi)
+        detections = [
+            ((int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])), radius(M["m00"]), c)
+            for c, M in zip(contours, moments)
+        ]
+
+        return detections
 
 
 class ArUcoTarget:
-    def __init__(self, dict_name, allowed_ids):
-        pass
+    def __init__(self, aruco_dict, allowed_ids):
+        self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
+        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        self.allowed_ids = allowed_ids
 
     def find(self, image):
-        pass
+        def detection(corners):
+            center = np.int0(np.mean(corners, axis=0))
+            size = math.sqrt(cv2.contourArea(corners))
+            return ((center[0], center[1]), size, corners)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.aruco_parameters
+        )
+
+        # de-nest data array
+        corners = [c[0] for c in corners]
+        ids = [x[0] for x in ids] if ids is not None else []
+
+        corners = [corners[i] for i in range(len(ids)) if ids[i] in self.allowed_ids]
+        detections = [detection(c) for c in corners]
+        
+        return detections
 
 
 class BlobTracker:
     class Parameters:
         def __init__(
-            self, tracking_distance=15, max_history_length=200, point_history_length=5
+            self, point_history_length=5
         ):
-            self.tracking_distance = tracking_distance
-            self.max_history_length = max_history_length
             self.point_history_length = point_history_length
 
     def __init__(
         self,
-        camera_calibration=None,
+        object_tracker,
+        target_type,
         parameters=Parameters(),
+        camera_calibration=None,
         window_title="CV Calibration",
     ):
+        self.objects = object_tracker
+        self.target_type = target_type
         self.parameters = parameters
-        self.objects = ObjectTracking(
-            parameters.tracking_distance, parameters.max_history_length
-        )
         self.window_title = window_title
         self.camera_calibration = camera_calibration
         self.robot_axes = None
@@ -174,7 +214,7 @@ class BlobTracker:
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
-        self.objects.setPrimaryTarget((x, y))
+        self.objects.set_primary_target((x, y))
 
     def _create_window(self):
         cv2.namedWindow(self.window_title)
@@ -201,67 +241,19 @@ class BlobTracker:
         self.video_capture.release()
         cv2.destroyWindow(self.window_title)
 
-    # Process a frame - find, track, outline all potential targets
-    def _process(self, frame):
-        blurred = cv2.medianBlur(frame, 2 * 5 + 1)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        thresholded = cv2.inRange(
-            hsv,
-            (125, int(35 * 2.55), int(25 * 2.55)),
-            (180, int(100 * 2.55), int(75 * 2.55)),
-        )
-
-        contours, _ = cv2.findContours(
-            thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        contours = [c for c in contours if cv2.contourArea(c) > 15]
-
-        # cv2.drawContours(frame, contours, -1, (0, 255, 0), 3)
-
-        moments = [cv2.moments(c) for c in contours]
-        radius = lambda area: math.sqrt(area / math.pi)
-        detections = [
-            (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]), radius(M["m00"]))
-            for M in moments
-            if M["m00"] > 0
-        ]
-
+    def _process_targets(self, image):
+        detections = self.target_type.find(image)
         self.objects.register(detections)
 
-        for i in range(len(contours)):
-            contour_center = (detections[i][0], detections[i][1])
-
+        for o in self.objects.objects:
             color = (0, 255, 0)
-            if (
-                self.objects.primaryTarget is not None
-                and self.objects.primaryTarget.position == contour_center
-            ):
+            if self.objects.primary_target == o:
                 color = (255, 0, 255)
+            
+            if o.is_stale():
+                color = (0, 255, 255)
 
-            cv2.drawContours(frame, [contours[i]], -1, color, 3)
-
-    def _process_aruco(self, frame):
-        def detection(corners):
-            center = np.int0(np.mean(corners, axis=0))
-            size = math.sqrt(cv2.contourArea(corners))
-            return (center[0], center[1], size)
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        parameters = cv2.aruco.DetectorParameters_create()
-        arucoDict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
-        corners, ids, _ = cv2.aruco.detectMarkers(
-            gray, arucoDict, parameters=parameters
-        )
-        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-
-        corners = [c[0] for c in corners]
-        ids = [x[0] for x in ids] if ids is not None else []
-
-        aruco_id = 0
-        corners = [corners[i] for i in range(len(ids)) if ids[i] == aruco_id]
-        detections = [detection(c) for c in corners]
-        self.objects.register(detections)
+            cv2.drawContours(image, [o.contour], -1, color, 3)
 
     def clear_history(self):
         self.objects.clear_history()
@@ -315,7 +307,7 @@ class BlobTracker:
                     print("\n\nFailed to read from camera")
                     self._quit_handler()
 
-                self._process_aruco(frame)
+                self._process_targets(frame)
 
                 if self._should_run_point_acquisition:
                     self._run_point_acquisition(frame)
@@ -339,7 +331,7 @@ class BlobTracker:
         self.should_stop = True
 
     def _run_point_acquisition(self, frame):
-        target = self.objects.primaryTarget
+        target = self.objects.primary_target
         if target is not None and target.is_strong():
             cv2.circle(
                 frame,
@@ -361,7 +353,7 @@ class BlobTracker:
         self._acquired_point = None
         self._should_run_point_acquisition = True
 
-        if self.objects.primaryTarget is None:
+        if self.objects.primary_target is None:
             print("Please click target on screen")
 
         while not self.should_stop:
