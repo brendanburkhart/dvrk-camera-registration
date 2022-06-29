@@ -195,7 +195,6 @@ class CameraRegistrationApplication:
                     self.center_arm()
                     break
 
-                print(pose.p)
                 self.arm.move_cp(pose).wait()
 
                 self.ok, image_point = self.tracker.acquire_point()

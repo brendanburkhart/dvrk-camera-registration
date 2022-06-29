@@ -105,7 +105,7 @@ class ObjectTracking:
 
         # Matrix of minimum distance between each detection and each tracked object
         distances = np.array(
-            [[obj.distance_to(d) for d in detections] for obj in self.objects]
+            [[obj.distance_to(d[0]) for d in detections] for obj in self.objects]
         )
 
         # Array of closest tracked object to each detection
@@ -253,7 +253,8 @@ class BlobTracker:
             if o.is_stale():
                 color = (0, 255, 255)
 
-            cv2.drawContours(image, [o.contour], -1, color, 3)
+            contour = np.array([(x, y) for [x, y] in o.contour], dtype=np.int)
+            cv2.drawContours(image, [contour], -1, color, 3)
 
     def clear_history(self):
         self.objects.clear_history()
