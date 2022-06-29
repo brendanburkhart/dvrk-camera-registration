@@ -24,6 +24,7 @@ import numpy as np
 import os
 import PyKDL
 import rospy
+import scipy.spatial
 import sys
 import xml.etree.ElementTree as ET
 
@@ -108,24 +109,23 @@ class CameraRegistrationApplication:
         print("Press enter or 'd' when done")
 
         safe_depth = 0.0
-        safe_radius = 0.0
+        safe_points = [np.array([0, 0, 0])]
         self.done = False
 
         while self.ok and not self.done:
             pose = self.arm.measured_cp()
             position = np.array([pose.p[0], pose.p[1], pose.p[2]])
             depth = math.fabs(position[2]) - 0.05
-            safe_depth = max(safe_depth, depth)
-
-            r = np.linalg.norm(position)
-            alpha = math.asin(pose.p[0]/r)
-            beta = math.asin(pose.p[1]/r)
-            radius = math.sqrt(alpha**2 + beta**2)
-            safe_radius = max(safe_radius, radius)
+            safe_points.append(position)
 
             rospy.sleep(self.expected_interval)
 
-        return self.ok, (safe_depth, safe_radius)
+        safe_points = np.array(safe_points)
+        hull = scipy.spatial.ConvexHull(safe_points)
+        hull = safe_points[hull.vertices]
+        safe_range = scipy.spatial.Delaunay(hull)
+
+        return self.ok, (safe_depth, safe_range)
 
     # instrument needs to be inserted past cannula to use Cartesian commands,
     # this will move instrument if necessary so Cartesian commands can be used
@@ -152,17 +152,15 @@ class CameraRegistrationApplication:
     # range_of_motion = (depth, radius, center) describes a
     #     cone with tip at RCM, base centered at (center, depth)
     # Generates slices^3 poses total
-    def registration_poses(self, range_of_motion, slices=4):
-        points = []
-        for i, j, k in itertools.product(range(slices), range(slices), range(slices)):
-            r = range_of_motion[0]*(i+1)/slices + 0.05
-            radius = range_of_motion[1]*(j+1)/slices
-            angle = 2*math.pi*(k+1)/slices
+    def registration_poses(self, range_of_motion, slices=4, size=0.125, depth=0.2):
+        offset = np.array([-0.5 * size, -0.5 * size, -depth])
+        scale = size / (slices - 1)
+        cube_points = np.mgrid[0:slices, 0:slices, 0:slices].T.reshape(-1, 3)
+        cube_points = scale * cube_points + offset
 
-            alpha = radius*math.cos(angle)
-            beta = radius*math.sin(angle)
-            point = [r*math.sin(alpha), r*math.sin(beta), -r]
-            points.append(point)
+        hull = range_of_motion[1]
+        in_hull = hull.find_simplex(cube_points) >= 0
+        points = cube_points[in_hull]
 
         # Preserve current tool orientation
         goal_rotation = self.arm.measured_cp().M
@@ -287,7 +285,7 @@ class CameraRegistrationApplication:
     def _init_tracking(self):
         object_tracker = blob_tracking.ObjectTracking(15, 200)
         target_type = blob_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
-        parameters = blob_tracking.BlobTracker.Parameters(50)
+        parameters = blob_tracking.BlobTracker.Parameters(20)
         self.tracker = blob_tracking.BlobTracker(object_tracker, target_type, parameters, self.camera_calibration)
 
     # application entry point
