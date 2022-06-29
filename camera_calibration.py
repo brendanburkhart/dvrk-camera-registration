@@ -48,6 +48,7 @@ class CameraCalibration:
         return image
 
     def project_points(self, object_points, rodrigues_rotation, translation_vector):
+        # don't need to account for cropping if we use new camera matrix
         image_points, _ = cv2.projectPoints(
             object_points,
             rodrigues_rotation,
@@ -55,10 +56,6 @@ class CameraCalibration:
             self.new_camera_matrix,
             self.no_distortion,
         )
-
-        # account for cropping
-        x, y, w, h = self.roi
-        image_points += np.array([-x, -y])
 
         # opencv double-nests the points for some reason, i.e. each point is array([[x, y]])
         image_points = image_points.reshape((-1, 2))
