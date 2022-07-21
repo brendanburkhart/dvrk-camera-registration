@@ -92,40 +92,60 @@ class CameraRegistrationApplication:
 
         return True
 
-    def _min_inscribed_circle(self, points):
-        hull = cv2.convexHull(points)
-        hull = hull + np.array([180, 180])
-        hull = hull.reshape((-1, 2)).astype(np.int32)
-
-        mask = np.zeros((360, 360), dtype='uint8')
-        cv2.drawContours(mask, [hull], 0, 255, cv2.FILLED)
-        distance_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5, cv2.DIST_LABEL_PIXEL)
-        _, radius, _, center = cv2.minMaxLoc(distance_map)
-
-        return (center, radius)
-
-    def determine_safe_range_of_motion(self):
+    def determine_safe_range_of_motion(self, valid_points_counter):
         print("Release the clutch and move the arm around to establish the area the arm can move in")
         print("Press enter or 'd' when done")
 
-        safe_depth = 0.0
         safe_points = [np.array([0, 0, 0])]
-        self.done = False
 
-        while self.ok and not self.done:
-            pose = self.arm.measured_cp()
-            position = np.array([pose.p[0], pose.p[1], pose.p[2]])
-            depth = math.fabs(position[2]) - 0.05
-            safe_points.append(position)
+        def calculate_range_of_motion(points):
+            points = np.array(points)
+            
+            try:
+                hull = scipy.spatial.ConvexHull(points)
+            except scipy.spatial.QhullError:
+                return None
 
-            rospy.sleep(self.expected_interval)
+            hull_points = points[hull.vertices]
+            range_of_motion = scipy.spatial.Delaunay(hull_points)
+            return range_of_motion
 
-        safe_points = np.array(safe_points)
-        hull = scipy.spatial.ConvexHull(safe_points)
-        hull = safe_points[hull.vertices]
-        safe_range = scipy.spatial.Delaunay(hull)
+        point_count = -1
 
-        return self.ok, (safe_depth, safe_range)
+        def collect_points():
+            nonlocal point_count
+            nonlocal safe_points
+
+            self.done = False
+
+            while self.ok and not self.done:
+                pose = self.arm.measured_cp()
+                position = np.array([pose.p[0], pose.p[1], pose.p[2]])
+                safe_points.append(position)
+    
+                rom = calculate_range_of_motion(safe_points)
+                count = valid_points_counter(rom) if rom is not None else 0
+                if count > point_count:
+                    point_count = count
+                    print("Points within range: {} (want >10, more is better)".format(count), end="\r")
+
+                rospy.sleep(self.expected_interval)
+
+            return self.ok
+        
+        while True:
+            collect_points()
+            if not self.ok:
+                return False, None
+
+            rom = calculate_range_of_motion(safe_points)
+            count = valid_points_counter(rom) if rom is not None else 0
+            if count < 10:
+                print("Insufficient range of motion, please continue")
+            else:
+                break
+                
+        return self.ok, rom
 
     # instrument needs to be inserted past cannula to use Cartesian commands,
     # this will move instrument if necessary so Cartesian commands can be used
@@ -152,14 +172,13 @@ class CameraRegistrationApplication:
     # range_of_motion = (depth, radius, center) describes a
     #     cone with tip at RCM, base centered at (center, depth)
     # Generates slices^3 poses total
-    def registration_poses(self, range_of_motion, slices=4, size=0.125, depth=0.2):
+    def registration_poses(self, range_of_motion, slices=5, size=0.1, depth=0.2):
         offset = np.array([-0.5 * size, -0.5 * size, -depth])
         scale = size / (slices - 1)
         cube_points = np.mgrid[0:slices, 0:slices, 0:slices].T.reshape(-1, 3)
         cube_points = scale * cube_points + offset
 
-        hull = range_of_motion[1]
-        in_hull = hull.find_simplex(cube_points) >= 0
+        in_hull = range_of_motion.find_simplex(cube_points) >= 0
         points = cube_points[in_hull]
 
         # Preserve current tool orientation
@@ -176,7 +195,7 @@ class CameraRegistrationApplication:
         if not ok:
             return False
 
-        target_shift = np.array([0, 0, -0.04])
+        target_shift = np.array([0, 0, -0.07])
 
         try:
             # Slow down arm so blob tracker doesn't lose target
@@ -302,7 +321,8 @@ class CameraRegistrationApplication:
             if not self.ok:
                 return
 
-            self.ok, safe_range = self.determine_safe_range_of_motion()
+            counter = lambda rom: len(self.registration_poses(rom, 4))
+            self.ok, safe_range = self.determine_safe_range_of_motion(counter)
             if not self.ok:
                 return
 
@@ -319,6 +339,7 @@ class CameraRegistrationApplication:
 
         finally:
             self.tracker.stop()
+            self.arm.unregister()
 
 
 def main():
