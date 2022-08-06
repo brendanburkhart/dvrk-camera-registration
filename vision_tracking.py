@@ -53,7 +53,11 @@ class TrackedObject:
     # if no match is found, strength decays by drop_off to prevent strength from oscillating
     def update(self, detection):
         if detection is not None:
-            self.position, self.size, self.contour = detection.position, detection.size, detection.contour
+            self.position, self.size, self.contour = (
+                detection.position,
+                detection.size,
+                detection.contour,
+            )
             self.location_history.append(self.position)
 
             # cap strength so objects never remain too long
@@ -66,13 +70,26 @@ class TrackedObject:
 
 # Track all detected objects as they move over time
 class ObjectTracking:
-    # max_distance is how far objects can move between frames
-    # and still be considered the same object
-    def __init__(self, max_distance, max_history):
+    class Parameters:
+        def __init__(
+            self, max_distance=0.02, max_history=200, max_strength=15, drop_off=2
+        ):
+            self.max_distance = max_distance
+            self.max_history = max_history
+            self.max_strength = max_strength
+            self.drop_off = drop_off
+
+    # max_distance is how far objects can move between frames and still be considered
+    # the same object. expressed as fraction of maximum image dimension
+    def __init__(self, parameters):
         self.objects = []
         self.primary_target = None
-        self.max_distance = max_distance
-        self.max_history = max_history
+        self.parameters = parameters
+        self.max_distance_pixels = 1000 * self.parameters.max_distance
+
+    def configure_image_size(self, shape):
+        image_size = max(shape)
+        self.max_distance_pixels = image_size * self.parameters.max_distance
 
     # mark on object as the primary object to track
     def set_primary_target(self, position, margin=1.35):
@@ -92,11 +109,22 @@ class ObjectTracking:
     # removing, updating, and adding tracked objects as needed
     def register(self, detections):
         # create tracked obejcts for detections, mark all detections as unmatched
-        detections = [[TrackedObject(d, max_history=self.max_history) , False] for d in detections]
+        detections = [
+            [
+                TrackedObject(
+                    d,
+                    max_strength=self.parameters.max_strength,
+                    max_history=self.parameters.max_history,
+                    drop_off=self.parameters.drop_off,
+                ),
+                False,
+            ]
+            for d in detections
+        ]
 
         # find closest unmatched detection to object
         def closest_detection(obj):
-            index, min_distance = None, self.max_distance
+            index, min_distance = None, self.max_distance_pixels
 
             for i, (detection, matched) in enumerate(detections):
                 distance = obj.distance_to(detection.position)
@@ -111,7 +139,7 @@ class ObjectTracking:
             if index is None:
                 obj.update(None)
             else:
-                detections[index][1] = True # mark detection as matched
+                detections[index][1] = True  # mark detection as matched
                 obj.update(detections[index][0])
 
         # detections not matched to existing tracked objects become new tracked objects
@@ -137,9 +165,9 @@ class ColorTarget:
         def detection(contour):
             M = cv2.moments(contour)
             center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-            size = math.sqrt(M["m00"]/math.pi)
+            size = math.sqrt(M["m00"] / math.pi)
             return (center, size, contour)
-        
+
         # Process a frame - find, track, outline all potential targets
         blurred = cv2.medianBlur(image, 2 * self.blur_aperature + 1)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
@@ -148,7 +176,10 @@ class ColorTarget:
         contours, _ = cv2.findContours(
             thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        contours = [c for c in contours if cv2.contourArea(c) > self.contour_min_size]
+
+        # Make contour_min_size relative to maximum image dimension
+        contour_min_size = self.contour_min_size * max(image.shape)
+        contours = [c for c in contours if cv2.contourArea(c) > contour_min_size]
         # De-nest contour points
         contours = [c.reshape(-1, 2) for c in contours]
         detections = [detection(c) for c in contours]
@@ -163,14 +194,14 @@ class ArUcoTarget:
         self.aruco_parameters.adaptiveThreshWinSizeMin = 5
         self.aruco_parameters.adaptiveThreshWinSizeMax = 40
         self.aruco_parameters.adaptiveThreshWinSizeStep = 5
-        #self.aruco_parameters.minMarkerPerimeterRate = 0.005
-        #self.aruco_parameters.polygonalApproxAccuracyRate = 0.15
-        #self.aruco_parameters.minMarkerDistanceRate = 0.005
-        #self.aruco_parameters.minDistanceToBorder = 1
-        #self.aruco_parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2
-        #self.aruco_parameters.perspectiveRemovePixelPerCell = 10
-        #self.aruco_parameters.maxErroneousBitsInBorderRate = 0.6
-        #self.aruco_parameters.errorCorrectionRate = 1.0
+        # self.aruco_parameters.minMarkerPerimeterRate = 0.005
+        # self.aruco_parameters.polygonalApproxAccuracyRate = 0.15
+        # self.aruco_parameters.minMarkerDistanceRate = 0.005
+        # self.aruco_parameters.minDistanceToBorder = 1
+        # self.aruco_parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2
+        # self.aruco_parameters.perspectiveRemovePixelPerCell = 10
+        # self.aruco_parameters.maxErroneousBitsInBorderRate = 0.6
+        # self.aruco_parameters.errorCorrectionRate = 1.0
 
         self.allowed_ids = allowed_ids
 
@@ -197,9 +228,7 @@ class ArUcoTarget:
 
 class VisionTracker:
     class Parameters:
-        def __init__(
-            self, point_history_length=5
-        ):
+        def __init__(self, point_history_length=5):
             self.point_history_length = point_history_length
 
     def __init__(
@@ -243,6 +272,7 @@ class VisionTracker:
             print("\n\nFailed to read from camera.")
             return False
 
+        self.objects.configure_image_size(frame.shape)
         if self.camera_calibration is not None:
             self.camera_calibration.configure_image_size(frame.shape)
 
@@ -260,7 +290,7 @@ class VisionTracker:
             color = (0, 255, 0)
             if self.objects.primary_target == obj:
                 color = (255, 0, 255)
-            
+
             if obj.is_stale():
                 color = (0, 255, 255)
 
@@ -332,7 +362,7 @@ class VisionTracker:
                 times.put(time.time())
                 if times.qsize() >= 60:
                     t = time.time() - times.get()
-                    print("FPS: {}".format(60/t))
+                    print("FPS: {}".format(60 / t))
                 key = cv2.waitKey(20)
                 key = key & 0xFF  # Upper bits are modifiers (control, alt, etc.)
                 escape = 27
