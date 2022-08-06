@@ -195,7 +195,7 @@ class ArUcoTarget:
         return detections
 
 
-class BlobTracker:
+class VisionTracker:
     class Parameters:
         def __init__(
             self, point_history_length=5

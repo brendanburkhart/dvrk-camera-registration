@@ -30,7 +30,7 @@ import xml.etree.ElementTree as ET
 
 import cisst_msgs.srv
 
-import blob_tracking
+import vision_tracking
 from camera_calibration import CameraCalibration
 
 
@@ -240,7 +240,7 @@ class CameraRegistrationApplication:
         target_shift = np.array([0, 0, -0.035])
 
         try:
-            # Slow down arm so blob tracker doesn't lose target
+            # Slow down arm so vision tracker doesn't lose target
             self.arm.trajectory_j_set_ratio(0.2)
 
             object_points = []
@@ -354,10 +354,10 @@ class CameraRegistrationApplication:
         )
 
     def _init_tracking(self):
-        object_tracker = blob_tracking.ObjectTracking(15, 200)
-        target_type = blob_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
-        parameters = blob_tracking.BlobTracker.Parameters(20)
-        self.tracker = blob_tracking.BlobTracker(object_tracker, target_type, parameters, self.camera_calibration)
+        object_tracker = vision_tracking.ObjectTracking(15, 200)
+        target_type = vision_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
+        parameters = vision_tracking.VisionTracker.Parameters(20)
+        self.tracker = vision_tracking.VisionTracker(object_tracker, target_type, parameters, self.camera_calibration)
 
     def run(self):
         try:
