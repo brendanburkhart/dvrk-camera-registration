@@ -58,7 +58,7 @@ class TrackedObject:
             self.strength = min(self.strength + 1, self.max_strength)
             self.stale = False
         else:
-            self.strength -= 2
+            self.strength = max(self.strength - self.drop_off, 0)
             self.stale = True
 
 
@@ -92,7 +92,7 @@ class ObjectTracking:
         # No existing tracked objects, add all detections as new objects
         if len(self.objects) == 0:
             for d in detections:
-                self.objects.append(TrackedObject(d, self.max_history))
+                self.objects.append(TrackedObject(d, max_history=self.max_history))
 
             return
 
@@ -100,6 +100,11 @@ class ObjectTracking:
         if len(detections) == 0:
             for obj in self.objects:
                 obj.update(None)
+           
+            self.objects = [x for x in self.objects if x.strength > 0]
+            if not self.primary_target in self.objects and self.primary_target is not None:
+                print("Lost track of target! Please click on target to re-acquire")
+                self.primary_target = None
 
             return
 
@@ -117,7 +122,7 @@ class ObjectTracking:
             if distances[closest[i], i] <= self.max_distance:
                 self.objects[closest[i]].update(detection)
             else:
-                self.objects.append(TrackedObject(detection, self.max_history))
+                self.objects.append(TrackedObject(detection, max_history=self.max_history))
 
         # Update tracked objects not associated with current detection
         closest = np.argmin(distances, axis=1)
@@ -164,6 +169,18 @@ class ArUcoTarget:
     def __init__(self, aruco_dict, allowed_ids):
         self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
         self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        self.aruco_parameters.adaptiveThreshWinSizeMin = 5
+        self.aruco_parameters.adaptiveThreshWinSizeMax = 40
+        self.aruco_parameters.adaptiveThreshWinSizeStep = 5
+        #self.aruco_parameters.minMarkerPerimeterRate = 0.005
+        #self.aruco_parameters.polygonalApproxAccuracyRate = 0.15
+        #self.aruco_parameters.minMarkerDistanceRate = 0.005
+        #self.aruco_parameters.minDistanceToBorder = 1
+        #self.aruco_parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2
+        #self.aruco_parameters.perspectiveRemovePixelPerCell = 10
+        #self.aruco_parameters.maxErroneousBitsInBorderRate = 0.6
+        #self.aruco_parameters.errorCorrectionRate = 1.0
+
         self.allowed_ids = allowed_ids
 
     def find(self, image):
@@ -183,7 +200,7 @@ class ArUcoTarget:
 
         corners = [corners[i] for i in range(len(ids)) if ids[i] in self.allowed_ids]
         detections = [detection(c) for c in corners]
-        
+
         return detections
 
 

@@ -28,9 +28,10 @@ import scipy.spatial
 import sys
 import xml.etree.ElementTree as ET
 
+import cisst_msgs.srv
+
 import blob_tracking
 from camera_calibration import CameraCalibration
-import direct_linear_transformation as DLT
 
 
 class CameraRegistrationApplication:
@@ -65,6 +66,7 @@ class CameraRegistrationApplication:
             )
         )
         self.expected_interval = expected_interval
+        self.cartesian_insertion_minimum = 0.055
         self.arm = dvrk.psm(arm_name=robot_name, expected_interval=expected_interval)
 
         return True
@@ -87,7 +89,6 @@ class CameraRegistrationApplication:
         base_frame_topic = "/{}/set_base_frame".format(self.arm.namespace())
         self.set_base_frame_pub = rospy.Publisher(base_frame_topic, Pose, queue_size=1, latch=True)
         self.set_base_frame_pub.publish(identity)
-        rospy.sleep(2.0) # Needed to base frame change to work for some reason
         print("Base frame cleared\n")
 
         return True
@@ -150,13 +151,11 @@ class CameraRegistrationApplication:
     # instrument needs to be inserted past cannula to use Cartesian commands,
     # this will move instrument if necessary so Cartesian commands can be used
     def enter_cartesian_space(self):
-        cartesian_insertion_minimum = 0.05
-
         pose = np.copy(self.arm.measured_jp())
-        if pose[2] >= cartesian_insertion_minimum:
+        if pose[2] >= self.cartesian_insertion_minimum:
             return True
 
-        pose[2] = cartesian_insertion_minimum
+        pose[2] = self.cartesian_insertion_minimum
         self.arm.move_jp(pose).wait()
         return True
 
@@ -171,8 +170,51 @@ class CameraRegistrationApplication:
     # Generate series of arm poses within safe rang of motion
     # range_of_motion = (depth, radius, center) describes a
     #     cone with tip at RCM, base centered at (center, depth)
+    def registration_poses(self, slices=6, rom=math.pi/4, max_depth=0.17):
+        query_cp_name = "{}/local/query_cp".format(self.arm.namespace()) 
+        local_query_cp = rospy.ServiceProxy(query_cp_name, cisst_msgs.srv.QueryForwardKinematics)
+
+        # Scale to keep point density equal as depth varies
+        scale_rom = lambda depth: math.atan((max_depth/depth)*math.tan(rom))
+
+        def merge_coordinates(alpha, betas, depth):
+            alphas = np.repeat(alpha, slices)
+            depths = np.repeat(depth, slices)
+            return np.column_stack([alphas, betas, depths])
+
+        js_points = []
+        depths = np.linspace(max_depth, self.cartesian_insertion_minimum, slices)
+        for i, depth in enumerate(depths):
+            parity = 1 if i % 2 == 0 else -1
+            theta = scale_rom(depth)*parity
+            alphas = np.linspace(-theta, theta, slices)
+            # Alternate direction so robot follows shortest path
+            for i, alpha in enumerate(alphas):
+                parity = 1 if i % 2 == 0 else -1
+                betas = np.linspace(-parity*theta, parity*theta, slices)
+                js_points.extend(merge_coordinates(alpha, betas, depth))
+
+        # We generated square grid, crop to circle so that overall angle
+        # stays within specified range of motion
+        js_points = [p for p in js_points if (p[0]**2 + p[1]**2) <= rom**2]
+
+        cs_points = []
+        for point in js_points:
+            # query forward kinematics to get equivalent Cartesian point
+            kinematics_request = cisst_msgs.srv.QueryForwardKinematicsRequest()
+            kinematics_request.jp.position = [point[0], point[1], point[2], 0.0, 0.0, 0.0, 0.0, 0.0]
+            response = local_query_cp(kinematics_request)
+            point = response.cp.pose.position
+            cs_points.append(np.array([point.x, point.y, point.z]))
+
+        goal_orientation= self.arm.measured_cp().M
+        points = [PyKDL.Vector(p[0], p[1], p[2]) for p in cs_points]
+        poses = [PyKDL.Frame(goal_orientation, p) for p in points]
+
+        return poses
+
     # Generates slices^3 poses total
-    def registration_poses(self, range_of_motion, slices=5, size=0.1, depth=0.2):
+    def _registration_poses(self, range_of_motion, slices=5, size=0.1, depth=0.2):
         offset = np.array([-0.5 * size, -0.5 * size, -depth])
         scale = size / (slices - 1)
         cube_points = np.mgrid[0:slices, 0:slices, 0:slices].T.reshape(-1, 3)
@@ -195,7 +237,7 @@ class CameraRegistrationApplication:
         if not ok:
             return False
 
-        target_shift = np.array([0, 0, -0.07])
+        target_shift = np.array([0, 0, -0.035])
 
         try:
             # Slow down arm so blob tracker doesn't lose target
@@ -265,18 +307,28 @@ class CameraRegistrationApplication:
         return self.ok, rvec, tvec
 
     def save_registration(self, rvec, tvec, file_name):
-        rotation_matrix, _ = cv2.Rodrigues(rvec)
+        _rotation, _ = cv2.Rodrigues(rvec)
 
-        # Correct OpenCV y-axis convention?
+        rotation = _rotation.T
 
-        world_to_camera = np.zeros((4, 4))
-        world_to_camera[0:3, 0:3] = rotation_matrix
-        #world_to_camera[0:3, 3:4] = tvec
-        world_to_camera[3, 3] = 1.0
+        transform = np.eye(4)
+        transform[0:3, 0:3] = _rotation
+        transform[0:3, 3:4] = tvec
+        
+        #print(transform)
 
+        #angle = np.linalg.norm(rvec)
+        #axis = rvec.reshape((-1,)) / angle
+
+        #alpha = 0.5 * angle;
+    
+        #q_rotation = Quaternion(axis[0]*math.sin(alpha), axis[1]*math.sin(alpha), axis[2]*math.sin(alpha), math.cos(alpha))
+        #pykdl_tf = Pose(Point(tvec[0], tvec[1], tvec[2]), q_rotation)
+        #self.set_base_frame_pub.publish(pykdl_tf)
+               
         base_frame = {
             "reference-frame": "camera",
-            "transform": world_to_camera.tolist(),
+            "transform": transform.tolist(),
         }
 
         with open(file_name, "w") as f:
@@ -307,7 +359,6 @@ class CameraRegistrationApplication:
         parameters = blob_tracking.BlobTracker.Parameters(20)
         self.tracker = blob_tracking.BlobTracker(object_tracker, target_type, parameters, self.camera_calibration)
 
-    # application entry point
     def run(self):
         try:
             self.ok = True
@@ -321,21 +372,23 @@ class CameraRegistrationApplication:
             if not self.ok:
                 return
 
-            counter = lambda rom: len(self.registration_poses(rom, 4))
-            self.ok, safe_range = self.determine_safe_range_of_motion(counter)
+            #counter = lambda rom: len(self.registration_poses(rom, 5))
+            #self.ok, safe_range = self.determine_safe_range_of_motion(counter)
             if not self.ok:
                 return
 
-            poses = self.registration_poses(safe_range, 4)
-            data = self.collect_data(poses)
-            if not self.ok:
-                return
+            poses = self.registration_poses()
+            for i in range(1):
+                self.setup()
+                data = self.collect_data(poses)
+                if not self.ok:
+                    return
 
-            ok, rvec, tvec = self.compute_registration(*data)
-            if not ok:
-                return
-
-            self.save_registration(rvec, tvec, "./camera_registration.json")
+                ok, rvec, tvec = self.compute_registration(*data)
+                if not ok:
+                    return
+        
+                self.save_registration(rvec, tvec, "./camera_registration.json")
 
         finally:
             self.tracker.stop()

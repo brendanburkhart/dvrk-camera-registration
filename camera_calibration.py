@@ -29,6 +29,10 @@ class CameraCalibration:
         h, w = shape[:2]
         alpha = 1.0
         self.new_camera_matrix, self.roi = cv2.getOptimalNewCameraMatrix(self.camera_matrix, self.distortion_coef, (w,h), alpha, (w,h))
+        self.camera_matrix[0, 2] = w//2
+        self.camera_matrix[1, 2] = h//2
+        self.new_camera_matrix[0, 2] = w//2
+        self.new_camera_matrix[1, 2] = h//2
         self.no_distortion = np.array([], dtype=np.float32)
     
     def undistort(self, image):
@@ -57,6 +61,8 @@ class CameraCalibration:
             return ok, 0.0, rotation, translation
 
         projected_points = self.project_points(object_points, rotation, translation)
+        _, j = cv2.projectPoints(object_points, rotation, translation, self.new_camera_matrix, self.no_distortion)
+        print(j)
         reprojection_error = np.mean(np.linalg.norm(image_points - projected_points, axis=1))
 
         return ok, reprojection_error, rotation, translation 
