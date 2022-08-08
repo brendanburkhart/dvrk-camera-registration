@@ -18,8 +18,8 @@ import cv2
 import math
 import numpy as np
 import threading
-import time
 import queue
+import camera
 
 
 # Represents a single tracked detection, with location history information
@@ -33,7 +33,7 @@ class TrackedObject:
         self.max_strength = max_strength
         self.drop_off = drop_off
 
-        # queue will 'remember' last max_history object locations
+        # deque will 'remember' last max_history object locations
         self.location_history = collections.deque(maxlen=max_history)
         self.location_history.append(self.position)
 
@@ -69,7 +69,7 @@ class TrackedObject:
 
 
 # Track all detected objects as they move over time
-class ObjectTracking:
+class ObjectTracker:
     class Parameters:
         def __init__(
             self, max_distance=0.02, max_history=200, max_strength=15, drop_off=2
@@ -191,9 +191,9 @@ class ArUcoTarget:
     def __init__(self, aruco_dict, allowed_ids):
         self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
         self.aruco_parameters = cv2.aruco.DetectorParameters_create()
-        self.aruco_parameters.adaptiveThreshWinSizeMin = 5
+        self.aruco_parameters.adaptiveThreshWinSizeMin = 10
         self.aruco_parameters.adaptiveThreshWinSizeMax = 40
-        self.aruco_parameters.adaptiveThreshWinSizeStep = 5
+        self.aruco_parameters.adaptiveThreshWinSizeStep = 10
         # self.aruco_parameters.minMarkerPerimeterRate = 0.005
         # self.aruco_parameters.polygonalApproxAccuracyRate = 0.15
         # self.aruco_parameters.minMarkerDistanceRate = 0.005
@@ -211,9 +211,8 @@ class ArUcoTarget:
             size = math.sqrt(cv2.contourArea(corners))
             return ((center[0], center[1]), size, corners)
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = cv2.aruco.detectMarkers(
-            gray, self.aruco_dict, parameters=self.aruco_parameters
+            image, self.aruco_dict, parameters=self.aruco_parameters
         )
 
         # de-nest data array
@@ -233,19 +232,21 @@ class VisionTracker:
 
     def __init__(
         self,
-        object_tracker,
+        object_tracker: ObjectTracker,
         target_type,
+        camera: camera.Camera,
         parameters=Parameters(),
-        camera_calibration=None,
         window_title="Vision tracking",
     ):
         self.objects = object_tracker
         self.target_type = target_type
         self.parameters = parameters
         self.window_title = window_title
-        self.camera_calibration = camera_calibration
+        self.camera = camera
         self.robot_axes = None
         self.points = []
+        # move image so callbacks run in correct thread
+        self.image_queue = queue.Queue(maxsize=1)
 
     def _mouse_callback(self, event, x, y, flags, params):
         if event != cv2.EVENT_LBUTTONDOWN:
@@ -256,27 +257,6 @@ class VisionTracker:
     def _create_window(self):
         cv2.namedWindow(self.window_title)
         cv2.setMouseCallback(self.window_title, self._mouse_callback)
-
-    def _init_video(self):
-        self.video_capture = cv2.VideoCapture()
-        self.video_capture.set(cv2.CAP_PROP_FPS, 30)
-        # auto-focus messes with camera calibration
-        self.video_capture.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        # large buffer introduces lag
-        self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        ok = self.video_capture.open(0)
-        if ok:
-            ok, frame = self.video_capture.read()
-
-        if not ok:
-            print("\n\nFailed to read from camera.")
-            return False
-
-        self.objects.configure_image_size(frame.shape)
-        if self.camera_calibration is not None:
-            self.camera_calibration.configure_image_size(frame.shape)
-
-        return ok
 
     def __del__(self):
         self.video_capture.release()
@@ -303,10 +283,10 @@ class VisionTracker:
     def set_robot_axes(self, rvec, tvec):
         scale = 0.10
         axes = scale * np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
-        self.robot_axes = self.camera_calibration.project_points(axes, rvec, tvec)
+        self.robot_axes = self.camera.project_points(axes, rvec, tvec)
 
     def display_points(self, points, rvec, tvec, color):
-        projected_points = self.camera_calibration.project_points(points, rvec, tvec)
+        projected_points = self.camera.project_points(points, rvec, tvec)
         self.points.append((projected_points, color))
 
     def display_points_2d(self, points, color):
@@ -326,6 +306,15 @@ class VisionTracker:
             end = tuple(np.int0(axes[i + 1]))
             cv2.line(frame, start, end, color, 3)
 
+    def _add_image(self, image):
+        # replace old image if not read yet
+        try:
+            self.image_queue.get(block=False)
+        except queue.Empty:
+            pass
+
+        self.image_queue.put(image, block=False)
+
     # In background, run object tracking and display video
     def start(self, enter_handler, quit_handler):
         self.should_stop = False
@@ -334,21 +323,16 @@ class VisionTracker:
         self._should_run_point_acquisition = False
         self._should_run_rcm_tracking = False
 
+        self.camera.set_callback(self._add_image)
+
         def run_camera():
             self._create_window()
-            ok = self._init_video()
 
-            times = queue.Queue(maxsize=60)
-
-            while ok and not self.should_stop:
-                ok, frame = self.video_capture.read()
-                frame = (
-                    self.camera_calibration.undistort(frame)
-                    if self.camera_calibration is not None
-                    else frame
-                )
-                if not ok:
-                    print("\n\nFailed to read from camera")
+            while not self.should_stop:
+                try:
+                    frame = self.image_queue.get(block=True, timeout=1)
+                except queue.Empty:
+                    print("No camera image available, waited for 1 second")
                     self._quit_handler()
 
                 self._process_targets(frame)
@@ -359,10 +343,6 @@ class VisionTracker:
                 self.draw_axes(frame, self.robot_axes, (255, 255, 0))
                 self.draw_points(frame)
                 cv2.imshow(self.window_title, frame)
-                times.put(time.time())
-                if times.qsize() >= 60:
-                    t = time.time() - times.get()
-                    print("FPS: {}".format(60 / t))
                 key = cv2.waitKey(20)
                 key = key & 0xFF  # Upper bits are modifiers (control, alt, etc.)
                 escape = 27

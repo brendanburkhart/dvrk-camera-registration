@@ -15,7 +15,7 @@
 
 import argparse
 import cv2
-import dvrk
+import psm
 from geometry_msgs.msg import Pose, Point, Quaternion
 import itertools
 import json
@@ -31,45 +31,13 @@ import xml.etree.ElementTree as ET
 import cisst_msgs.srv
 
 import vision_tracking
-from camera_calibration import CameraCalibration
-
+from camera import Camera
 
 class CameraRegistrationApplication:
-    def configure(self, robot_name, config_file, expected_interval):
-        # check that the config file is good
-        if not os.path.exists(config_file):
-            print('Config file "{:s}" not found'.format(config_file))
-            return False
-
-        self.tree = ET.parse(config_file)
-        root = self.tree.getroot()
-
-        xpath_search_results = root.findall("./Robot")
-        if len(xpath_search_results) != 1:
-            print('Can\'t find "Robot" in config file "{:s}"'.format(config_file))
-            return False
-
-        xmlRobot = xpath_search_results[0]
-        # Verify robot name
-        if xmlRobot.get("Name") != robot_name:
-            print(
-                'Found robot "{:s}" instead of "{:s}", are you using the right config file?'.format(
-                    xmlRobot.get("Name"), robot_name
-                )
-            )
-            return False
-
-        serial_number = xmlRobot.get("SN")
-        print(
-            'Successfully found robot "{:s}", serial number {:s} in XML file'.format(
-                robot_name, serial_number
-            )
-        )
+    def __init__(self, arm_name, expected_interval, camera):
+        self.camera = camera
         self.expected_interval = expected_interval
-        self.cartesian_insertion_minimum = 0.055
-        self.arm = dvrk.psm(arm_name=robot_name, expected_interval=expected_interval)
-
-        return True
+        self.arm = psm.PSM(arm_name=arm_name, expected_interval=expected_interval)
 
     def setup(self):
         print("Enabling...")
@@ -85,12 +53,7 @@ class CameraRegistrationApplication:
         print("Homing complete\n")
 
         # Set base frame transformation to identity
-        identity = Pose(Point(0.0, 0.0, 0.0), Quaternion(0.0, 0.0, 0.0, 1.0))
-        base_frame_topic = "/{}/set_base_frame".format(self.arm.namespace())
-        self.set_base_frame_pub = rospy.Publisher(
-            base_frame_topic, Pose, queue_size=1, latch=True
-        )
-        self.set_base_frame_pub.publish(identity)
+        self.arm.clear_base_frame()
         print("Base frame cleared\n")
 
         return True
@@ -157,34 +120,10 @@ class CameraRegistrationApplication:
 
         return self.ok, rom
 
-    # instrument needs to be inserted past cannula to use Cartesian commands,
-    # this will move instrument if necessary so Cartesian commands can be used
-    def enter_cartesian_space(self):
-        pose = np.copy(self.arm.measured_jp())
-        if pose[2] >= self.cartesian_insertion_minimum:
-            return True
-
-        pose[2] = self.cartesian_insertion_minimum
-        self.arm.move_jp(pose).wait()
-        return True
-
-    # return arm to upright position
-    def center_arm(self):
-        pose = np.copy(self.arm.measured_jp())
-        pose.fill(0.0)
-        pose[2] = 0.05
-        self.arm.move_jp(pose).wait()
-        return True
-
     # Generate series of arm poses within safe rang of motion
     # range_of_motion = (depth, radius, center) describes a
     #     cone with tip at RCM, base centered at (center, depth)
     def registration_poses(self, slices=6, rom=math.pi / 4, max_depth=0.17):
-        query_cp_name = "{}/local/query_cp".format(self.arm.namespace())
-        local_query_cp = rospy.ServiceProxy(
-            query_cp_name, cisst_msgs.srv.QueryForwardKinematics
-        )
-
         # Scale to keep point density equal as depth varies
         scale_rom = lambda depth: math.atan((max_depth / depth) * math.tan(rom))
 
@@ -194,7 +133,7 @@ class CameraRegistrationApplication:
             return np.column_stack([alphas, betas, depths])
 
         js_points = []
-        depths = np.linspace(max_depth, self.cartesian_insertion_minimum, slices)
+        depths = np.linspace(max_depth, self.arm.cartesian_insertion_minimum, slices)
         for i, depth in enumerate(depths):
             parity = 1 if i % 2 == 0 else -1
             theta = scale_rom(depth) * parity
@@ -209,23 +148,8 @@ class CameraRegistrationApplication:
         # stays within specified range of motion
         js_points = [p for p in js_points if (p[0] ** 2 + p[1] ** 2) <= rom**2]
 
-        cs_points = []
-        for point in js_points:
-            # query forward kinematics to get equivalent Cartesian point
-            kinematics_request = cisst_msgs.srv.QueryForwardKinematicsRequest()
-            kinematics_request.jp.position = [
-                point[0],
-                point[1],
-                point[2],
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]
-            response = local_query_cp(kinematics_request)
-            point = response.cp.pose.position
-            cs_points.append(np.array([point.x, point.y, point.z]))
+        # Get cartesian-space equivalents to joint-space poses
+        cs_points = [self.arm.forward_kinematics(point) for point in js_points]
 
         goal_orientation = self.arm.measured_cp().M
         points = [PyKDL.Vector(p[0], p[1], p[2]) for p in cs_points]
@@ -233,35 +157,14 @@ class CameraRegistrationApplication:
 
         return poses
 
-    # Generates slices^3 poses total
-    def _registration_poses(self, range_of_motion, slices=5, size=0.1, depth=0.2):
-        offset = np.array([-0.5 * size, -0.5 * size, -depth])
-        scale = size / (slices - 1)
-        cube_points = np.mgrid[0:slices, 0:slices, 0:slices].T.reshape(-1, 3)
-        cube_points = scale * cube_points + offset
-
-        in_hull = range_of_motion.find_simplex(cube_points) >= 0
-        points = cube_points[in_hull]
-
-        # Preserve current tool orientation
-        goal_rotation = self.arm.measured_cp().M
-
-        points = [PyKDL.Vector(p[0], p[1], p[2]) for p in points]
-        poses = [PyKDL.Frame(goal_rotation, p) for p in points]
-
-        return poses
-
     # move arm to each goal pose, and measure both robot and camera relative positions
     def collect_data(self, poses):
-        ok = self.enter_cartesian_space()
-        if not ok:
-            return False
-
+        self.arm.enter_cartesian_space().wait()
         target_shift = np.array([0, 0, -0.035])
 
         try:
             # Slow down arm so vision tracker doesn't lose target
-            self.arm.trajectory_j_set_ratio(0.2)
+            self.arm.set_speed(0.2)
 
             object_points = []
             image_points = []
@@ -271,7 +174,7 @@ class CameraRegistrationApplication:
             # Move arm to variety of positions and record image & world coordinates
             for i, pose in enumerate(poses):
                 if not self.ok:
-                    self.center_arm()
+                    self.arm.center()
                     break
 
                 self.arm.move_cp(pose).wait()
@@ -293,15 +196,15 @@ class CameraRegistrationApplication:
 
         finally:
             # Restore normal arm speed
-            self.arm.trajectory_j_set_ratio(1.0)
+            self.arm.set_speed(1.0)
 
-        self.center_arm()
+        self.arm.center()
         return object_points, image_points
 
     def compute_registration(self, object_points, image_points):
         object_points = np.array(object_points, dtype=np.float32)
         image_points = np.array(image_points, dtype=np.float32)
-        ok, error, rvec, tvec = self.camera_calibration.get_pose(
+        ok, error, rvec, tvec = self.camera.get_pose(
             object_points, image_points
         )
         print("Registration error: {} px".format(error))
@@ -315,10 +218,6 @@ class CameraRegistrationApplication:
         print(
             "Rotation angle: {} radians, translation distance: {} m".format(angle, dist)
         )
-        rotation_axis = rvec.reshape((-1,)) / np.linalg.norm(rvec)
-        translation_axis = tvec.reshape((-1,)) / np.linalg.norm(tvec)
-        print("Axes: {}, {}".format(rotation_axis, translation_axis))
-        print("Axis alignment: {}".format(abs(np.dot(rotation_axis, translation_axis))))
         print()
 
         self.done = False
@@ -329,24 +228,11 @@ class CameraRegistrationApplication:
         return self.ok, rvec, tvec
 
     def save_registration(self, rvec, tvec, file_name):
-        _rotation, _ = cv2.Rodrigues(rvec)
-
-        rotation = _rotation.T
+        rotation, _ = cv2.Rodrigues(rvec)
 
         transform = np.eye(4)
-        transform[0:3, 0:3] = _rotation
+        transform[0:3, 0:3] = rotation
         transform[0:3, 3:4] = tvec
-
-        # print(transform)
-
-        # angle = np.linalg.norm(rvec)
-        # axis = rvec.reshape((-1,)) / angle
-
-        # alpha = 0.5 * angle;
-
-        # q_rotation = Quaternion(axis[0]*math.sin(alpha), axis[1]*math.sin(alpha), axis[2]*math.sin(alpha), math.cos(alpha))
-        # pykdl_tf = Pose(Point(tvec[0], tvec[1], tvec[2]), q_rotation)
-        # self.set_base_frame_pub.publish(pykdl_tf)
 
         base_frame = {
             "reference-frame": "camera",
@@ -367,21 +253,13 @@ class CameraRegistrationApplication:
     def _on_enter(self):
         self.done = True
 
-    def configure_calibration(self, camera_matrix_file, distortion_coefs_file):
-        self.camera_matrix = np.load(camera_matrix_file)
-        self.distortion_coefs = np.load(distortion_coefs_file)
-
-        self.camera_calibration = CameraCalibration(
-            self.camera_matrix, self.distortion_coefs
-        )
-
     def _init_tracking(self):
-        tracking_parameters = vision_tracking.ObjectTracking.Parameters()
-        object_tracker = vision_tracking.ObjectTracking(tracking_parameters)
+        tracking_parameters = vision_tracking.ObjectTracker.Parameters(max_distance=0.08)
+        object_tracker = vision_tracking.ObjectTracker(tracking_parameters)
         target_type = vision_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
         parameters = vision_tracking.VisionTracker.Parameters(20)
         self.tracker = vision_tracking.VisionTracker(
-            object_tracker, target_type, parameters, self.camera_calibration
+            object_tracker, target_type, self.camera, parameters
         )
 
     def run(self):
@@ -445,33 +323,22 @@ def main():
     )
     parser.add_argument(
         "-c",
-        "--config",
+        "--camera_image_topic",
         type=str,
         required=True,
-        help="arm IO config file, i.e. something like sawRobotIO1394-xwz-12345.xml",
+        help="ROS topic of rectified color image transport",
     )
     parser.add_argument(
-        "-m",
-        "--matrix",
+        "-t",
+        "--camera_info_topic",
         type=str,
-        default="camera_matrix.npy",
-        help="file path of camera matrix",
-    )
-    parser.add_argument(
-        "-d",
-        "--distortion",
-        type=str,
-        default="distortion_coefs.npy",
-        help="file path of distortion coefficients",
+        required=True,
+        help="ROS topic of camera info for camera",
     )
     args = parser.parse_args(argv[1:])  # skip argv[0], script name
 
-    application = CameraRegistrationApplication()
-    ok = application.configure(args.arm, args.config, args.interval)
-    if not ok:
-        return
-
-    application.configure_calibration(args.matrix, args.distortion)
+    camera = Camera(args.camera_info_topic, args.camera_image_topic)
+    application = CameraRegistrationApplication(args.arm, args.interval, camera)
     application.run()
 
 
