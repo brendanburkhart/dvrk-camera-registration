@@ -334,6 +334,7 @@ class VisionTracker:
                 except queue.Empty:
                     print("No camera image available, waited for 1 second")
                     self._quit_handler()
+                    continue
 
                 self._process_targets(frame)
 

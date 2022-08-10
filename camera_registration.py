@@ -17,16 +17,13 @@ import argparse
 import cv2
 import psm
 from geometry_msgs.msg import Pose, Point, Quaternion
-import itertools
 import json
 import math
 import numpy as np
-import os
 import PyKDL
 import rospy
 import scipy.spatial
 import sys
-import xml.etree.ElementTree as ET
 
 import cisst_msgs.srv
 
@@ -34,9 +31,10 @@ import vision_tracking
 from camera import Camera
 
 class CameraRegistrationApplication:
-    def __init__(self, arm_name, expected_interval, camera):
+    def __init__(self, arm_name, expected_interval, target_z_offset, camera):
         self.camera = camera
         self.expected_interval = expected_interval
+        self.target_z_offset = target_z_offset
         self.arm = psm.PSM(arm_name=arm_name, expected_interval=expected_interval)
 
     def setup(self):
@@ -123,7 +121,7 @@ class CameraRegistrationApplication:
     # Generate series of arm poses within safe rang of motion
     # range_of_motion = (depth, radius, center) describes a
     #     cone with tip at RCM, base centered at (center, depth)
-    def registration_poses(self, slices=6, rom=math.pi / 4, max_depth=0.17):
+    def registration_poses(self, slices=4, rom=math.pi / 4, max_depth=0.17):
         # Scale to keep point density equal as depth varies
         scale_rom = lambda depth: math.atan((max_depth / depth) * math.tan(rom))
 
@@ -160,7 +158,7 @@ class CameraRegistrationApplication:
     # move arm to each goal pose, and measure both robot and camera relative positions
     def collect_data(self, poses):
         self.arm.enter_cartesian_space().wait()
-        target_shift = np.array([0, 0, -0.035])
+        target_offset = np.array([0, 0, self.target_z_offset])
 
         try:
             # Slow down arm so vision tracker doesn't lose target
@@ -184,7 +182,7 @@ class CameraRegistrationApplication:
 
                 position = self.arm.measured_cp().p
                 position = np.array([position[0], position[1], position[2]])
-                object_points.append(position + target_shift)
+                object_points.append(position)
 
                 progress = (i + 1) / len(poses)
                 print(
@@ -198,7 +196,6 @@ class CameraRegistrationApplication:
             # Restore normal arm speed
             self.arm.set_speed(1.0)
 
-        self.arm.center()
         return object_points, image_points
 
     def compute_registration(self, object_points, image_points):
@@ -209,16 +206,12 @@ class CameraRegistrationApplication:
         )
         print("Registration error: {} px".format(error))
 
-        angle = np.linalg.norm(rvec)
-        dist = np.linalg.norm(tvec)
         self.tracker.set_robot_axes(rvec, tvec)
         self.tracker.display_points(object_points, rvec, tvec, (255, 0, 255))
         self.tracker.display_points_2d(image_points, (0, 255, 0))
-        print()
-        print(
-            "Rotation angle: {} radians, translation distance: {} m".format(angle, dist)
-        )
-        print()
+
+        distance = np.linalg.norm(tvec)
+        print("\nTranslation distance: {} m\n".format(distance))
 
         self.done = False
         print("Press enter or 'd' to continue")
@@ -281,17 +274,17 @@ class CameraRegistrationApplication:
                 return
 
             poses = self.registration_poses()
-            for i in range(1):
-                self.setup()
-                data = self.collect_data(poses)
-                if not self.ok:
-                    return
+            data = self.collect_data(poses)
+            if not self.ok:
+                return
 
-                ok, rvec, tvec = self.compute_registration(*data)
-                if not ok:
-                    return
+            self.tracker.stop()
 
-                self.save_registration(rvec, tvec, "./camera_registration.json")
+            ok, rvec, tvec = self.compute_registration(*data)
+            if not ok:
+                return
+
+            self.save_registration(rvec, tvec, "./camera_registration.json")
 
         finally:
             self.tracker.stop()
@@ -322,6 +315,13 @@ def main():
         help="expected interval in seconds between messages sent by the device",
     )
     parser.add_argument(
+        "-o",
+        "--offset",
+        type=float,
+        default=-0.04,
+        help="z-offset of vision target center",
+    )
+    parser.add_argument(
         "-c",
         "--camera_image_topic",
         type=str,
@@ -338,7 +338,7 @@ def main():
     args = parser.parse_args(argv[1:])  # skip argv[0], script name
 
     camera = Camera(args.camera_info_topic, args.camera_image_topic)
-    application = CameraRegistrationApplication(args.arm, args.interval, camera)
+    application = CameraRegistrationApplication(args.arm, args.interval, args.offset, camera)
     application.run()
 
 

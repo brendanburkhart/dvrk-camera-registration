@@ -16,7 +16,6 @@ from dvrk.arm import *
 from cisst_msgs.srv import QueryForwardKinematics, QueryForwardKinematicsRequest
 import rospy
 import numpy
-import crtk.wait_move_handle
 from geometry_msgs.msg import Pose, Point, Quaternion
 import numpy as np
 
@@ -65,8 +64,11 @@ class PSM(arm):
     def enter_cartesian_space(self):
         pose = np.copy(self.measured_jp())
         if pose[2] >= self.cartesian_insertion_minimum:
-            handle = crtk.wait_move_handle(self)
-            return handle
+            class NoWaitHandle:
+                def wait(self): pass
+                def is_busy(self): return False
+
+            return NoWaitHandle()
 
         pose[2] = self.cartesian_insertion_minimum
         return self.move_jp(pose)
