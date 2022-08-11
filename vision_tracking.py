@@ -20,7 +20,7 @@ import numpy as np
 import threading
 import queue
 import camera
-
+import time
 
 # Represents a single tracked detection, with location history information
 class TrackedObject:
@@ -72,12 +72,18 @@ class TrackedObject:
 class ObjectTracker:
     class Parameters:
         def __init__(
-            self, max_distance=0.02, max_history=200, max_strength=15, drop_off=2
+            self,
+            max_distance=0.02,
+            max_history=200,
+            max_strength=15,
+            drop_off=2,
+            unique_target=False,
         ):
             self.max_distance = max_distance
             self.max_history = max_history
             self.max_strength = max_strength
             self.drop_off = drop_off
+            self.unique_target = unique_target
 
     # max_distance is how far objects can move between frames and still be considered
     # the same object. expressed as fraction of maximum image dimension
@@ -105,9 +111,33 @@ class ObjectTracker:
         for obj in self.objects:
             obj.location_history.clear()
 
+    def _register_unique(self, detections):
+        count = len(detections)
+        if count == 0:
+            if self.primary_target is not None:
+                self.primary_target.update(None)
+        elif count == 1:
+            obj = TrackedObject(detections[0], max_history=self.parameters.max_history)
+            if self.primary_target is not None:
+                self.primary_target.update(obj)
+            else:
+                self.primary_target = obj
+                self.objects = [self.primary_target]
+        else:
+            self.primary_target.update(None)
+            print("WARNING: unique_target set but found {} targets".format(count))
+
+        if self.primary_target is None or self.primary_target.strength == 0:
+            self.primary_target = None
+            self.objects = []
+
     # register detections from the current frame with tracked objects,
     # removing, updating, and adding tracked objects as needed
     def register(self, detections):
+        if self.parameters.unique_target:
+            self._register_unique(detections)
+            return
+
         # create tracked obejcts for detections, mark all detections as unmatched
         detections = [
             [
@@ -149,7 +179,8 @@ class ObjectTracker:
 
         # remove stale tracked objects and check if primary target is stale
         self.objects = [x for x in self.objects if x.strength > 0]
-        if not self.primary_target in self.objects and self.primary_target is not None:
+
+        if self.primary_target not in self.objects and self.primary_target is not None:
             print("Lost track of target! Please click on target to re-acquire")
             self.primary_target = None
 
@@ -258,8 +289,8 @@ class VisionTracker:
         cv2.namedWindow(self.window_title)
         cv2.setMouseCallback(self.window_title, self._mouse_callback)
 
-    def __del__(self):
-        self.video_capture.release()
+    def _close(self):
+        self.camera.set_callback(None)
         cv2.destroyWindow(self.window_title)
 
     def _process_targets(self, image):
@@ -352,12 +383,17 @@ class VisionTracker:
                 elif key == ord("d") or key == ord("\n") or key == ord("\r"):
                     self._enter_handler()
 
+            self._close()
+
         self.background_task = threading.Thread(target=run_camera)
         self.background_task.start()
         return True
 
     def stop(self):
         self.should_stop = True
+
+    def target_visible(self):
+        return self.objects.primary_target is not None
 
     def _run_point_acquisition(self, frame):
         target = self.objects.primary_target
@@ -377,7 +413,7 @@ class VisionTracker:
                 self._acquired_point = np.int32(mean)
 
     # Get location of target
-    def acquire_point(self):
+    def acquire_point(self, timeout=None):
         self.objects.clear_history()
         self._acquired_point = None
         self._should_run_point_acquisition = True
@@ -385,7 +421,12 @@ class VisionTracker:
         if self.objects.primary_target is None:
             print("Please click target on screen")
 
+        start = time.time()
+
         while not self.should_stop:
+            if timeout is not None and (time.time() - start) > timeout:
+                return False, None
+
             if self._acquired_point is not None:
                 return True, self._acquired_point
 

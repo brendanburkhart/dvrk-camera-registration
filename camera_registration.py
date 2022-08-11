@@ -16,19 +16,16 @@
 import argparse
 import cv2
 import psm
-from geometry_msgs.msg import Pose, Point, Quaternion
 import json
-import math
 import numpy as np
-import PyKDL
 import rospy
-import scipy.spatial
 import sys
+import math
 
-import cisst_msgs.srv
-
-import vision_tracking
 from camera import Camera
+import pose_generator
+import vision_tracking
+
 
 class CameraRegistrationApplication:
     def __init__(self, arm_name, expected_interval, target_z_offset, camera):
@@ -56,104 +53,102 @@ class CameraRegistrationApplication:
 
         return True
 
-    def determine_safe_range_of_motion(self, valid_points_counter):
+    def determine_safe_range_of_motion(self):
         print(
             "Release the clutch and move the arm around to establish the area the arm can move in"
         )
         print("Press enter or 'd' when done")
 
-        safe_points = [np.array([0, 0, 0])]
-
-        def calculate_range_of_motion(points):
-            points = np.array(points)
-
-            try:
-                hull = scipy.spatial.ConvexHull(points)
-            except scipy.spatial.QhullError:
-                return None
-
-            hull_points = points[hull.vertices]
-            range_of_motion = scipy.spatial.Delaunay(hull_points)
-            return range_of_motion
-
-        point_count = -1
-
-        def collect_points():
-            nonlocal point_count
-            nonlocal safe_points
-
+        def collect_points(hull_points):
             self.done = False
 
             while self.ok and not self.done:
-                pose = self.arm.measured_cp()
-                position = np.array([pose.p[0], pose.p[1], pose.p[2]])
-                safe_points.append(position)
-
-                rom = calculate_range_of_motion(safe_points)
-                count = valid_points_counter(rom) if rom is not None else 0
-                if count > point_count:
-                    point_count = count
-                    print(
-                        "Points within range: {} (want >10, more is better)".format(
-                            count
-                        ),
-                        end="\r",
-                    )
+                pose = self.arm.measured_jp()
+                position = np.array([pose[0], pose[1], pose[2]])
+                hull_points.append(position)
 
                 rospy.sleep(self.expected_interval)
 
-            return self.ok
+            return hull_points
+
+        hull_points = []
 
         while True:
-            collect_points()
+            hull_points = collect_points(hull_points)
             if not self.ok:
                 return False, None
 
-            rom = calculate_range_of_motion(safe_points)
-            count = valid_points_counter(rom) if rom is not None else 0
-            if count < 10:
+            hull = pose_generator.convex_hull(hull_points)
+            if hull is None:
                 print("Insufficient range of motion, please continue")
             else:
-                break
+                return self.ok, hull
 
-        return self.ok, rom
+    # Generate `count`` arm poses within safe range of motion
+    def registration_poses(self, safe_range, count=10):
+        if safe_range is None:
+            return []
 
-    # Generate series of arm poses within safe rang of motion
-    # range_of_motion = (depth, radius, center) describes a
-    #     cone with tip at RCM, base centered at (center, depth)
-    def registration_poses(self, slices=4, rom=math.pi / 4, max_depth=0.17):
-        # Scale to keep point density equal as depth varies
-        scale_rom = lambda depth: math.atan((max_depth / depth) * math.tan(rom))
+        js_points = pose_generator.generate(safe_range, count)
 
-        def merge_coordinates(alpha, betas, depth):
-            alphas = np.repeat(alpha, slices)
-            depths = np.repeat(depth, slices)
-            return np.column_stack([alphas, betas, depths])
+        tool_shaft_rotation = self.arm.measured_jp()[3]
 
-        js_points = []
-        depths = np.linspace(max_depth, self.arm.cartesian_insertion_minimum, slices)
-        for i, depth in enumerate(depths):
-            parity = 1 if i % 2 == 0 else -1
-            theta = scale_rom(depth) * parity
-            alphas = np.linspace(-theta, theta, slices)
-            # Alternate direction so robot follows shortest path
-            for i, alpha in enumerate(alphas):
-                parity = 1 if i % 2 == 0 else -1
-                betas = np.linspace(-parity * theta, parity * theta, slices)
-                js_points.extend(merge_coordinates(alpha, betas, depth))
-
-        # We generated square grid, crop to circle so that overall angle
-        # stays within specified range of motion
-        js_points = [p for p in js_points if (p[0] ** 2 + p[1] ** 2) <= rom**2]
-
-        # Get cartesian-space equivalents to joint-space poses
-        cs_points = [self.arm.forward_kinematics(point) for point in js_points]
-
-        goal_orientation = self.arm.measured_cp().M
-        points = [PyKDL.Vector(p[0], p[1], p[2]) for p in cs_points]
-        poses = [PyKDL.Frame(goal_orientation, p) for p in points]
+        poses = [np.array([*joints, tool_shaft_rotation, 0, 0, 0]) for joints in js_points]
 
         return poses
+
+    # From starting position within view of camera, determine the camera's
+    # field of view via exploration while staying within safe range of motion
+    def explore_camera_view(self, safe_range):
+        start_jp = np.copy(self.arm.measured_jp())
+        current_jp = np.copy(start_jp)
+
+        image_points = []
+        object_points = []
+
+        def explore_axis(pose, axis, direction, sub=False):
+            nonlocal image_points
+            nonlocal object_points
+            current_pose = np.copy(pose)
+            step = direction * 0.0025 * math.pi
+
+            while self.ok:
+                current_pose[axis] += step
+                if not pose_generator.in_hull(safe_range, current_pose):
+                    return
+
+                self.arm.move_jp(current_pose).wait()
+                rospy.sleep(0.2)
+
+                if not self.tracker.target_visible():
+                    return
+
+                ok, image_point = self.tracker.acquire_point(timeout=2.0)
+                if not ok:
+                    print("Hmm")
+                    continue
+
+                image_points.append(image_point)
+
+                position = self.arm.measured_cp().p
+                position = np.array([position[0], position[1], position[2]])
+                object_points.append(position)
+
+                if sub:
+                    explore_axis(current_pose, 0, 1)
+                    self.arm.move_jp(current_pose).wait()
+                    explore_axis(current_pose, 0, -1)
+                    self.arm.move_jp(current_pose).wait()
+                    explore_axis(current_pose, 1, 1)
+                    self.arm.move_jp(current_pose).wait()
+                    explore_axis(current_pose, 1, -1)
+                    self.arm.move_jp(current_pose).wait()
+
+        explore_axis(current_jp, 2, 1, sub=True)
+        self.arm.move_jp(start_jp).wait()
+        explore_axis(current_jp, 2, -1, sub=True)
+
+        return object_points, image_points
 
     # move arm to each goal pose, and measure both robot and camera relative positions
     def collect_data(self, poses):
@@ -172,12 +167,14 @@ class CameraRegistrationApplication:
             # Move arm to variety of positions and record image & world coordinates
             for i, pose in enumerate(poses):
                 if not self.ok:
-                    self.arm.center()
                     break
 
-                self.arm.move_cp(pose).wait()
+                self.arm.move_jp(pose).wait()
 
-                self.ok, image_point = self.tracker.acquire_point()
+                ok, image_point = self.tracker.acquire_point(timeout=4.0)
+                if not ok:
+                    continue
+
                 image_points.append(image_point)
 
                 position = self.arm.measured_cp().p
@@ -247,10 +244,10 @@ class CameraRegistrationApplication:
         self.done = True
 
     def _init_tracking(self):
-        tracking_parameters = vision_tracking.ObjectTracker.Parameters(max_distance=0.08)
+        tracking_parameters = vision_tracking.ObjectTracker.Parameters(max_distance=0.08, unique_target=True)
         object_tracker = vision_tracking.ObjectTracker(tracking_parameters)
         target_type = vision_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
-        parameters = vision_tracking.VisionTracker.Parameters(20)
+        parameters = vision_tracking.VisionTracker.Parameters(2)
         self.tracker = vision_tracking.VisionTracker(
             object_tracker, target_type, self.camera, parameters
         )
@@ -268,21 +265,20 @@ class CameraRegistrationApplication:
             if not self.ok:
                 return
 
-            # counter = lambda rom: len(self.registration_poses(rom, 5))
-            # self.ok, safe_range = self.determine_safe_range_of_motion(counter)
+            self.ok, safe_range = self.determine_safe_range_of_motion()
             if not self.ok:
                 return
 
-            poses = self.registration_poses()
-            data = self.collect_data(poses)
+            # poses = self.registration_poses(safe_range, count=10)
+            data = self.explore_camera_view(safe_range)
             if not self.ok:
                 return
-
-            self.tracker.stop()
 
             ok, rvec, tvec = self.compute_registration(*data)
             if not ok:
                 return
+
+            self.tracker.stop()
 
             self.save_registration(rvec, tvec, "./camera_registration.json")
 
