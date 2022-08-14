@@ -219,7 +219,7 @@ class ColorTarget:
 
 
 class ArUcoTarget:
-    def __init__(self, aruco_dict, allowed_ids):
+    def __init__(self, marker_size, aruco_dict, allowed_ids):
         self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
         self.aruco_parameters = cv2.aruco.DetectorParameters_create()
         self.aruco_parameters.adaptiveThreshWinSizeMin = 10
@@ -235,6 +235,7 @@ class ArUcoTarget:
         # self.aruco_parameters.errorCorrectionRate = 1.0
 
         self.allowed_ids = allowed_ids
+        self.marker_size = marker_size
 
     def find(self, image):
         def detection(corners):
@@ -242,9 +243,7 @@ class ArUcoTarget:
             size = math.sqrt(cv2.contourArea(corners))
             return ((center[0], center[1]), size, corners)
 
-        corners, ids, _ = cv2.aruco.detectMarkers(
-            image, self.aruco_dict, parameters=self.aruco_parameters
-        )
+        corners, ids, _ = cv2.aruco.detectMarkers(image, self.aruco_dict, parameters=self.aruco_parameters)
 
         # de-nest data array
         corners = [c[0] for c in corners]
@@ -352,6 +351,7 @@ class VisionTracker:
         self._enter_handler = enter_handler
         self._quit_handler = quit_handler
         self._should_run_point_acquisition = False
+        self._should_run_pose_acquisition = False
         self._should_run_rcm_tracking = False
 
         self.camera.set_callback(self._add_image)
@@ -371,6 +371,9 @@ class VisionTracker:
 
                 if self._should_run_point_acquisition:
                     self._run_point_acquisition(frame)
+
+                if self._should_run_pose_acquisition:
+                    self._run_target_pose_acquisition(frame)
 
                 self.draw_axes(frame, self.robot_axes, (255, 255, 0))
                 self.draw_points(frame)
@@ -392,8 +395,31 @@ class VisionTracker:
     def stop(self):
         self.should_stop = True
 
+    def get_camera_frame(self):
+        return self.camera.get_camera_frame()
+
     def target_visible(self):
         return self.objects.primary_target is not None
+
+    def _run_target_pose_acquisition(self, frame):
+        target = self.objects.primary_target
+        if target is not None and target.is_strong():
+            cv2.circle(
+                frame,
+                target.position,
+                radius=3,
+                color=(0, 0, 255),
+                thickness=cv2.FILLED,
+            )
+
+            # once at least 5 data points have been collected since user selected
+            # target, output average location of target
+            if len(target.location_history) > self.parameters.point_history_length:
+                corners = np.array([target.contour])
+                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, self.target_type.marker_size, self.camera.camera_matrix, self.camera.no_distortion)
+                cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, rvecs[0], tvecs[0], 0.01)
+                rotation, _ = cv2.Rodrigues(rvecs[0])
+                self._acquired_pose = (rotation, tvecs[0, 0])
 
     def _run_point_acquisition(self, frame):
         target = self.objects.primary_target
@@ -429,5 +455,22 @@ class VisionTracker:
 
             if self._acquired_point is not None:
                 return True, self._acquired_point
+
+        return False, None
+
+    # Get pose of target
+    def acquire_pose(self, timeout=None):
+        self.objects.clear_history()
+        self._acquired_pose = None
+        self._should_run_pose_acquisition = True
+
+        start = time.time()
+
+        while not self.should_stop:
+            if timeout is not None and (time.time() - start) > timeout:
+                return False, None
+
+            if self._acquired_pose is not None:
+                return True, self._acquired_pose
 
         return False, None

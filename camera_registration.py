@@ -17,10 +17,11 @@ import argparse
 import cv2
 import psm
 import json
+import math
 import numpy as np
 import rospy
 import sys
-import math
+from scipy.spatial.transform import Rotation
 
 from camera import Camera
 import pose_generator
@@ -65,7 +66,12 @@ class CameraRegistrationApplication:
             while self.ok and not self.done:
                 pose = self.arm.measured_jp()
                 position = np.array([pose[0], pose[1], pose[2]])
-                hull_points.append(position)
+
+                # make list sparser by ensuring >2mm separation
+                euclidean = lambda x: np.array([math.sin(x[0])*x[2], math.sin(x[1])*x[2], math.cos(x[2])])
+                distance = lambda a, b: np.linalg.norm(euclidean(a) - euclidean(b))
+                if len(hull_points) == 0 or distance(position, hull_points[-1]) > 0.005:
+                    hull_points.append(position)
 
                 rospy.sleep(self.expected_interval)
 
@@ -84,130 +90,122 @@ class CameraRegistrationApplication:
             else:
                 return self.ok, hull
 
-    # Generate `count`` arm poses within safe range of motion
-    def registration_poses(self, safe_range, count=10):
-        if safe_range is None:
-            return []
-
-        js_points = pose_generator.generate(safe_range, count)
-
-        tool_shaft_rotation = self.arm.measured_jp()[3]
-
-        poses = [np.array([*joints, tool_shaft_rotation, 0, 0, 0]) for joints in js_points]
-
-        return poses
-
     # From starting position within view of camera, determine the camera's
     # field of view via exploration while staying within safe range of motion
     def explore_camera_view(self, safe_range):
         start_jp = np.copy(self.arm.measured_jp())
         current_jp = np.copy(start_jp)
 
-        image_points = []
-        object_points = []
+        target_poses = []
+        robot_poses = []
 
-        def explore_axis(pose, axis, direction, sub=False):
-            nonlocal image_points
-            nonlocal object_points
+        pose_generator.display_hull(safe_range)
+
+        def collect_point():
+            nonlocal target_poses
+            nonlocal robot_poses
+            
+            ok, target_pose = self.tracker.acquire_pose(timeout=2.0)
+            if not ok:
+                return False
+
+            target_poses.append(target_pose)
+
+            pose = self.arm.measured_cp().Inverse()
+            rotation_quaternion = Rotation.from_quat(pose.M.GetQuaternion())
+            rotation = rotation_quaternion.as_matrix()
+            translation = np.array([pose.p[0], pose.p[1], pose.p[2]])
+
+            robot_poses.append((rotation, np.array(translation)))
+
+            return True
+
+        def bisect_camera_view(pose, ray, max_steps=6):
+            start_pose = np.copy(pose)
             current_pose = np.copy(pose)
-            step = direction * 0.0025 * math.pi
 
-            while self.ok:
-                current_pose[axis] += step
-                if not pose_generator.in_hull(safe_range, current_pose):
-                    return
+            far_limit = pose_generator.intersection(safe_range, start_pose[0:3], ray)
+            near_limit = 0.0
+            furthest_viewed = near_limit
 
-                self.arm.move_jp(current_pose).wait()
-                rospy.sleep(0.2)
-
-                if not self.tracker.target_visible():
-                    return
-
-                ok, image_point = self.tracker.acquire_point(timeout=2.0)
-                if not ok:
-                    print("Hmm")
-                    continue
-
-                image_points.append(image_point)
-
-                position = self.arm.measured_cp().p
-                position = np.array([position[0], position[1], position[2]])
-                object_points.append(position)
-
-                if sub:
-                    explore_axis(current_pose, 0, 1)
-                    self.arm.move_jp(current_pose).wait()
-                    explore_axis(current_pose, 0, -1)
-                    self.arm.move_jp(current_pose).wait()
-                    explore_axis(current_pose, 1, 1)
-                    self.arm.move_jp(current_pose).wait()
-                    explore_axis(current_pose, 1, -1)
-                    self.arm.move_jp(current_pose).wait()
-
-        explore_axis(current_jp, 2, 1, sub=True)
-        self.arm.move_jp(start_jp).wait()
-        explore_axis(current_jp, 2, -1, sub=True)
-
-        return object_points, image_points
-
-    # move arm to each goal pose, and measure both robot and camera relative positions
-    def collect_data(self, poses):
-        self.arm.enter_cartesian_space().wait()
-        target_offset = np.array([0, 0, self.target_z_offset])
-
-        try:
-            # Slow down arm so vision tracker doesn't lose target
-            self.arm.set_speed(0.2)
-
-            object_points = []
-            image_points = []
-
-            print("Collecting data: 0% complete", end="\r")
-
-            # Move arm to variety of positions and record image & world coordinates
-            for i, pose in enumerate(poses):
+            for _ in range(max_steps):
                 if not self.ok:
                     break
 
-                self.arm.move_jp(pose).wait()
+                mid_point = 0.5*(near_limit + far_limit)
+                current_pose[0:3] = start_pose[0:3] + mid_point*ray
+                if not pose_generator.in_hull(safe_range, current_pose):
+                    print("Safety limit reached!")
+                    return
 
-                ok, image_point = self.tracker.acquire_point(timeout=4.0)
-                if not ok:
+                self.arm.move_jp(current_pose).wait()
+                rospy.sleep(2.0)
+
+                if not self.tracker.target_visible():
+                    far_limit = mid_point
+                    continue
+                else:
+                    near_limit = mid_point
+
+                ok = collect_point()
+                if ok:
+                    furthest_viewed = far_limit
+
+            return start_pose[0:3] + 0.8*furthest_viewed*ray
+
+        def collect(safe_range, start, end, pose, steps=10):
+            current_pose = np.copy(pose)
+            
+            for t in np.linspace(0, 1, steps):
+                if not self.ok:
+                    break
+                
+                current_pose[0:3] = start + t*(end - start)
+                if not pose_generator.in_hull(safe_range, current_pose):
+                    print("Safety limit reached!")
+                    return
+
+                self.arm.move_jp(current_pose).wait()
+                rospy.sleep(1.0)
+
+                if not self.tracker.target_visible():
                     continue
 
-                image_points.append(image_point)
+                collect_point
 
-                position = self.arm.measured_cp().p
-                position = np.array([position[0], position[1], position[2]])
-                object_points.append(position)
+        def explore_axis(pose, axis):
+            nonlocal target_poses
+            nonlocal robot_poses
+            ray = np.array([0, 0, 0])
+            
+            ray[axis] = 1
+            limit1 = bisect_camera_view(pose, ray)
+            ray[axis] = -1
+            limit2 = bisect_camera_view(pose, ray)
+            return [limit1, limit2]
 
-                progress = (i + 1) / len(poses)
-                print(
-                    "Collecting data: {}% complete".format(int(100 * progress)),
-                    end="\r",
-                )
+        limits = []
+        limits.extend(explore_axis(current_jp, 0))
+        limits.extend(explore_axis(current_jp, 1))
+        limits.extend(explore_axis(current_jp, 2))
 
-            print("\n")
+        for i in range(len(limits)//2):
+            for j in range(i+2, len(limits)):
+                collect(safe_range, limits[i], limits[j], current_jp)
 
-        finally:
-            # Restore normal arm speed
-            self.arm.set_speed(1.0)
+        return robot_poses, target_poses
 
-        return object_points, image_points
-
-    def compute_registration(self, object_points, image_points):
-        object_points = np.array(object_points, dtype=np.float32)
-        image_points = np.array(image_points, dtype=np.float32)
-        ok, error, rvec, tvec = self.camera.get_pose(
-            object_points, image_points
+    def compute_registration(self, robot_poses, target_poses):
+        rotation, translation = self.camera.calibrate_pose(
+            robot_poses, target_poses
         )
-        print("Registration error: {} px".format(error))
+        #print("Registration error: {} px".format(error))
 
-        self.tracker.set_robot_axes(rvec, tvec)
-        self.tracker.display_points(object_points, rvec, tvec, (255, 0, 255))
-        self.tracker.display_points_2d(image_points, (0, 255, 0))
+        # self.tracker.set_robot_axes(rvec, tvec)
+        # self.tracker.display_points(object_points, rvec, tvec, (255, 0, 255))
+        # self.tracker.display_points_2d(image_points, (0, 255, 0))
 
-        distance = np.linalg.norm(tvec)
+        distance = np.linalg.norm(translation)
         print("\nTranslation distance: {} m\n".format(distance))
 
         self.done = False
@@ -215,17 +213,15 @@ class CameraRegistrationApplication:
         while not self.done and self.ok:
             rospy.sleep(0.25)
 
-        return self.ok, rvec, tvec
+        return self.ok, rotation, translation
 
-    def save_registration(self, rvec, tvec, file_name):
-        rotation, _ = cv2.Rodrigues(rvec)
-
+    def save_registration(self, rotation, translation, file_name):
         transform = np.eye(4)
         transform[0:3, 0:3] = rotation
-        transform[0:3, 3:4] = tvec
+        transform[0:3, 3:4] = translation
 
         base_frame = {
-            "reference-frame": "camera",
+            "reference-frame": self.tracker.get_camera_frame() or "camera",
             "transform": transform.tolist(),
         }
 
@@ -244,10 +240,10 @@ class CameraRegistrationApplication:
         self.done = True
 
     def _init_tracking(self):
-        tracking_parameters = vision_tracking.ObjectTracker.Parameters(max_distance=0.08, unique_target=True)
+        tracking_parameters = vision_tracking.ObjectTracker.Parameters(max_strength=2, max_distance=0.08, unique_target=True)
         object_tracker = vision_tracking.ObjectTracker(tracking_parameters)
-        target_type = vision_tracking.ArUcoTarget(cv2.aruco.DICT_4X4_50, [0])
-        parameters = vision_tracking.VisionTracker.Parameters(2)
+        target_type = vision_tracking.ArUcoTarget(0.01, cv2.aruco.DICT_4X4_50, [0])
+        parameters = vision_tracking.VisionTracker.Parameters(1)
         self.tracker = vision_tracking.VisionTracker(
             object_tracker, target_type, self.camera, parameters
         )
@@ -280,7 +276,7 @@ class CameraRegistrationApplication:
 
             self.tracker.stop()
 
-            self.save_registration(rvec, tvec, "./camera_registration.json")
+            self.save_registration(rvec, tvec, "./{}_registration.json".format(self.arm.name))
 
         finally:
             self.tracker.stop()

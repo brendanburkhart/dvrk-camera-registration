@@ -32,7 +32,7 @@ class Camera:
         self.cv_bridge = CvBridge()
         self.image_callback = None
         self.camera_matrix = None
-        self.camera_frame = ""
+        self.camera_frame = None
         self.no_distortion = np.array([], dtype=np.float32)
 
         self.camera_info_topic = camera_info_topic
@@ -83,6 +83,24 @@ class Camera:
         reprojection_error = np.mean(np.linalg.norm(image_points - projected_points, axis=1))
 
         return ok, reprojection_error, rotation, translation
+
+    def calibrate_pose(self, robot_poses, target_poses):
+        robot_poses_r = np.array([p[0] for p in robot_poses], dtype=np.float32)
+        robot_poses_t = np.array([p[1] for p in robot_poses], dtype=np.float32)
+        target_poses_r = np.array([p[0] for p in target_poses], dtype=np.float32)
+        target_poses_t = np.array([p[1] for p in target_poses], dtype=np.float32)
+
+        print(robot_poses_r)
+        print(robot_poses_t)
+        print(target_poses_r)
+        print(target_poses_t)
+
+        rotation, translation = cv2.calibrateHandEye(robot_poses_r, robot_poses_t, target_poses_r, target_poses_t, method=cv2.CALIB_HAND_EYE_HORAUD)
+
+        rotation = np.linalg.inv(rotation)
+        translation = -np.matmul(rotation, translation)
+
+        return rotation, translation
 
     def unregister(self):
         self.info_callback.unregister()

@@ -36,6 +36,7 @@ class PSM(arm):
         self._arm__pub_list.append(self._set_base_frame_pub)
  
         self.cartesian_insertion_minimum = 0.055
+        self.name = arm_name
 
     # Sets speed ratio for move_cp/move_jp
     def set_speed(self, speed):
