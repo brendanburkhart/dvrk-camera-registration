@@ -54,22 +54,3 @@ def display_hull(hull):
     ax.set_ylabel("y")
     ax.set_zlabel("z")
     plt.show()
-
-# def random_point(simplex, points):
-#     dimension = len(simplex)
-#     barycentric_coordinates = rng.dirichlet(np.ones(dimension))
-
-#     # point is linear combination of simplex vertices
-#     return np.matmul(np.array(points)[simplex].T, barycentric_coordinates)
-
-# def generate(hull, count):
-#     hull, points, triangulation = hull
-
-#     sample_points = []
-#     for i in range(count):
-#         j = rng.integers(0, len(triangulation.simplices))
-#         random_simplex = triangulation.simplices[j]
-#         point = random_point(random_simplex, points)
-#         sample_points.append(point)
-
-#     return sample_points

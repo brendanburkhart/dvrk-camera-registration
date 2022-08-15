@@ -118,9 +118,15 @@ class CameraRegistrationApplication:
 
             robot_poses.append((rotation, np.array(translation)))
 
+            rospy.sleep(2.0)
+
+            ok, two_target_pose = self.tracker.acquire_pose(timeout=2.0)
+            if ok:
+                print(np.linalg.norm(target_pose[1] - two_target_pose[1]), np.linalg.norm(target_pose[0] - two_target_pose[0]))
+
             return True
 
-        def bisect_camera_view(pose, ray, max_steps=6):
+        def bisect_camera_view(pose, ray, max_steps=4):
             start_pose = np.copy(pose)
             current_pose = np.copy(pose)
 
@@ -139,24 +145,22 @@ class CameraRegistrationApplication:
                     return
 
                 self.arm.move_jp(current_pose).wait()
-                rospy.sleep(2.0)
-
-                if not self.tracker.target_visible():
-                    far_limit = mid_point
-                    continue
-                else:
-                    near_limit = mid_point
+                rospy.sleep(1.0)
 
                 ok = collect_point()
                 if ok:
+                    near_limit = mid_point
                     furthest_viewed = far_limit
+                else:
+                    far_limit = mid_point
 
-            return start_pose[0:3] + 0.8*furthest_viewed*ray
 
-        def collect(safe_range, start, end, pose, steps=10):
+            return start_pose[0:3] + 0.7*furthest_viewed*ray
+
+        def collect(safe_range, start, end, pose, steps=3):
             current_pose = np.copy(pose)
             
-            for t in np.linspace(0, 1, steps):
+            for t in np.linspace(1/(steps+1), 1-1/(steps+1), steps):
                 if not self.ok:
                     break
                 
@@ -171,7 +175,7 @@ class CameraRegistrationApplication:
                 if not self.tracker.target_visible():
                     continue
 
-                collect_point
+                collect_point()
 
         def explore_axis(pose, axis):
             nonlocal target_poses
@@ -189,17 +193,18 @@ class CameraRegistrationApplication:
         limits.extend(explore_axis(current_jp, 1))
         limits.extend(explore_axis(current_jp, 2))
 
-        for i in range(len(limits)//2):
-            for j in range(i+2, len(limits)):
+        for i in range(len(limits)):
+            start = i + 2 if i % 2 == 0 else i + 1 
+            for j in range(start, len(limits)):
                 collect(safe_range, limits[i], limits[j], current_jp)
 
         return robot_poses, target_poses
 
     def compute_registration(self, robot_poses, target_poses):
-        rotation, translation = self.camera.calibrate_pose(
+        error, rotation, translation = self.camera.calibrate_pose(
             robot_poses, target_poses
         )
-        #print("Registration error: {} px".format(error))
+        print("\nRegistration error: {}".format(error))
 
         # self.tracker.set_robot_axes(rvec, tvec)
         # self.tracker.display_points(object_points, rvec, tvec, (255, 0, 255))
@@ -253,16 +258,16 @@ class CameraRegistrationApplication:
             self.ok = True
 
             self._init_tracking()
-            self.ok = self.tracker.start(self._on_enter, self._on_quit)
+            self.ok = self.ok and self.tracker.start(self._on_enter, self._on_quit)
             if not self.ok:
                 return
 
-            self.ok = self.setup()
+            self.ok = self.ok and self.setup()
             if not self.ok:
                 return
 
-            self.ok, safe_range = self.determine_safe_range_of_motion()
-            if not self.ok:
+            ok, safe_range = self.determine_safe_range_of_motion()
+            if not self.ok or not ok:
                 return
 
             # poses = self.registration_poses(safe_range, count=10)

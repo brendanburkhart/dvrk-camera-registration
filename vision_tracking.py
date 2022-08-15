@@ -124,7 +124,8 @@ class ObjectTracker:
                 self.primary_target = obj
                 self.objects = [self.primary_target]
         else:
-            self.primary_target.update(None)
+            if self.primary_target is not None:
+                self.primary_target.update(None)
             print("WARNING: unique_target set but found {} targets".format(count))
 
         if self.primary_target is None or self.primary_target.strength == 0:
@@ -223,16 +224,10 @@ class ArUcoTarget:
         self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
         self.aruco_parameters = cv2.aruco.DetectorParameters_create()
         self.aruco_parameters.adaptiveThreshWinSizeMin = 10
-        self.aruco_parameters.adaptiveThreshWinSizeMax = 40
+        self.aruco_parameters.adaptiveThreshWinSizeMax = 50
         self.aruco_parameters.adaptiveThreshWinSizeStep = 10
-        # self.aruco_parameters.minMarkerPerimeterRate = 0.005
-        # self.aruco_parameters.polygonalApproxAccuracyRate = 0.15
-        # self.aruco_parameters.minMarkerDistanceRate = 0.005
-        # self.aruco_parameters.minDistanceToBorder = 1
-        # self.aruco_parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2
-        # self.aruco_parameters.perspectiveRemovePixelPerCell = 10
-        # self.aruco_parameters.maxErroneousBitsInBorderRate = 0.6
-        # self.aruco_parameters.errorCorrectionRate = 1.0
+        self.aruco_parameters.cornerRefinementWinSize = 20
+        self.aruco_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
         self.allowed_ids = allowed_ids
         self.marker_size = marker_size
@@ -374,6 +369,8 @@ class VisionTracker:
 
                 if self._should_run_pose_acquisition:
                     self._run_target_pose_acquisition(frame)
+                else:
+                    self.camera.publish_no_pose()
 
                 self.draw_axes(frame, self.robot_axes, (255, 255, 0))
                 self.draw_points(frame)
@@ -412,14 +409,24 @@ class VisionTracker:
                 thickness=cv2.FILLED,
             )
 
-            # once at least 5 data points have been collected since user selected
-            # target, output average location of target
-            if len(target.location_history) > self.parameters.point_history_length:
-                corners = np.array([target.contour])
-                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, self.target_type.marker_size, self.camera.camera_matrix, self.camera.no_distortion)
-                cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, rvecs[0], tvecs[0], 0.01)
-                rotation, _ = cv2.Rodrigues(rvecs[0])
-                self._acquired_pose = (rotation, tvecs[0, 0])
+            corners = np.array([target.contour])
+            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, self.target_type.marker_size, self.camera.camera_matrix, self.camera.no_distortion)
+            rotation_, _ = cv2.Rodrigues(rvecs[0])
+            self.camera.publish_pose(rotation_, tvecs[0, 0])
+            cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, rvecs[0], tvecs[0], 0.01)
+            self.samples.append((rvecs[0], tvecs[0, 0]))
+
+            if len(self.samples) >= 5:
+                positions = np.array([t for r, t in self.samples])
+                rvecs = np.array([r for r, t in self.samples])
+                position = np.mean(positions, axis=0)
+                rvec = np.mean(rvecs, axis=0)
+                rotation, _ = cv2.Rodrigues(rvec)
+                position_std = np.max(np.std(positions, axis=0))
+                rotation_std = np.max(np.std(rvecs, axis=0))
+                print("P,R std: {}, {}".format(position_std, rotation_std))
+                self._acquired_pose = (rotation, position)
+
 
     def _run_point_acquisition(self, frame):
         target = self.objects.primary_target
@@ -451,26 +458,42 @@ class VisionTracker:
 
         while not self.should_stop:
             if timeout is not None and (time.time() - start) > timeout:
+                self._should_run_point_acquisition = False
                 return False, None
 
             if self._acquired_point is not None:
+                self._should_run_point_acquisition = False
                 return True, self._acquired_point
 
+        self._should_run_point_acquisition = False
         return False, None
 
     # Get pose of target
     def acquire_pose(self, timeout=None):
         self.objects.clear_history()
         self._acquired_pose = None
-        self._should_run_pose_acquisition = True
+        self.samples = []
 
         start = time.time()
+        self._should_run_pose_acquisition = True
 
         while not self.should_stop:
-            if timeout is not None and (time.time() - start) > timeout:
-                return False, None
+            if timeout is not None:
+                elapsed = time.time() - start
+                early_timeout = len(self.samples) == 0 and elapsed > 0.5*timeout
+                if early_timeout:
+                    print("Early timeout!")
+                    self._should_run_pose_acquisition = False
+                    return False, None
+                elif elapsed > timeout:
+                    print("Timeout!")
+                    self._should_run_pose_acquisition = False
+                    return False, None
 
             if self._acquired_pose is not None:
+                self._should_run_pose_acquisition = False
                 return True, self._acquired_pose
 
+        print("Stopping acquire_pose")
+        self._should_run_pose_acquisition = False
         return False, None
