@@ -39,7 +39,6 @@ class Camera:
 
         self.camera_info_topic = camera_info_topic
         self.image_topic = image_topic
-        self.pose_publisher = rospy.Publisher("/vision_target_pose", PoseArray, queue_size=1)
 
     def set_callback(self, image_callback):
         if self.image_callback is not None and image_callback is not None:
@@ -55,26 +54,6 @@ class Camera:
 
     def get_camera_frame(self):
         return self.camera_frame
-
-    def publish_no_pose(self):
-        poses = PoseArray()
-        poses.header.frame_id = self.camera_frame
-        poses.header.stamp = rospy.Time.now()
-        self.pose_publisher.publish(poses)
-
-    def publish_pose(self, rotation, tvec):
-        matrix = np.eye(4)
-        matrix[0:3, 0:3] = rotation
-        q = tf.transformations.quaternion_from_matrix(matrix)
-        pose = Pose()
-        pose.position = Point(tvec[0], tvec[1], tvec[2])
-        pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        poses = PoseArray()
-        poses.poses.append(pose)
-        poses.header.frame_id = self.camera_frame
-        poses.header.stamp = rospy.Time.now()
-
-        self.pose_publisher.publish(poses)
 
     def _info_callback(self, info_msg):
         projection_matrix = np.array(info_msg.P).reshape((3, 4))
@@ -113,17 +92,31 @@ class Camera:
         target_poses_r = np.array([p[0] for p in target_poses], dtype=np.float32)
         target_poses_t = np.array([p[1] for p in target_poses], dtype=np.float32)
 
-        rotation, translation = cv2.calibrateHandEye(robot_poses_r, robot_poses_t, target_poses_r, target_poses_t, method=cv2.CALIB_HAND_EYE_HORAUD)
+        rotation, translation = cv2.calibrateHandEye(robot_poses_r, robot_poses_t, target_poses_r, target_poses_t, method=cv2.CALIB_HAND_EYE_PARK)
 
-        rotation = np.linalg.inv(rotation)
-        translation = -np.matmul(rotation, translation)
+        def to_homogenous(rotation, translation):
+            X = np.eye(4)
+            X[0:3, 0:3] = rotation
+            X[0:3, 3] = translation.reshape((3,))
+            return X
 
-        projected_points = np.matmul(rotation, robot_poses_t.T).T + translation[:, 0]
-        error = np.mean(np.linalg.norm(target_poses_t - projected_points, axis=1))
+        robot_transforms = [to_homogenous(r, t) for r, t in robot_poses]
+        target_transforms = [to_homogenous(r, t) for r, t in target_poses]
+        camera_transform = to_homogenous(rotation, translation)
+
+        transforms = []
+        for r, t in zip(robot_transforms, target_transforms):
+            a = np.matmul(np.matmul(r, camera_transform), t)
+            transforms.append(np.linalg.norm(a, ord="fro"))
+
+        transforms = np.array(transforms)
+
+        error = np.std(transforms - np.mean(transforms))
+
+        # bad: 0.0013
 
         return error, rotation, translation
 
     def unregister(self):
         self.info_callback.unregister()
         self.image_callback.unregister()
- 

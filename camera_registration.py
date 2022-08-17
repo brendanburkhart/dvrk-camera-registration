@@ -105,34 +105,27 @@ class CameraRegistrationApplication:
             nonlocal target_poses
             nonlocal robot_poses
             
-            ok, target_pose = self.tracker.acquire_pose(timeout=2.0)
+            ok, target_pose = self.tracker.acquire_pose(timeout=4.0)
             if not ok:
                 return False
 
             target_poses.append(target_pose)
 
-            pose = self.arm.measured_cp().Inverse()
+            pose = self.arm.measured_cp()
             rotation_quaternion = Rotation.from_quat(pose.M.GetQuaternion())
             rotation = rotation_quaternion.as_matrix()
             translation = np.array([pose.p[0], pose.p[1], pose.p[2]])
 
             robot_poses.append((rotation, np.array(translation)))
 
-            rospy.sleep(2.0)
-
-            ok, two_target_pose = self.tracker.acquire_pose(timeout=2.0)
-            if ok:
-                print(np.linalg.norm(target_pose[1] - two_target_pose[1]), np.linalg.norm(target_pose[0] - two_target_pose[0]))
-
             return True
 
-        def bisect_camera_view(pose, ray, max_steps=4):
+        def bisect_camera_view(pose, ray, max_steps=5):
             start_pose = np.copy(pose)
             current_pose = np.copy(pose)
 
             far_limit = pose_generator.intersection(safe_range, start_pose[0:3], ray)
             near_limit = 0.0
-            furthest_viewed = near_limit
 
             for _ in range(max_steps):
                 if not self.ok:
@@ -145,17 +138,16 @@ class CameraRegistrationApplication:
                     return
 
                 self.arm.move_jp(current_pose).wait()
-                rospy.sleep(1.0)
+                rospy.sleep(0.5)
 
                 ok = collect_point()
                 if ok:
                     near_limit = mid_point
-                    furthest_viewed = far_limit
                 else:
                     far_limit = mid_point
 
 
-            return start_pose[0:3] + 0.7*furthest_viewed*ray
+            return start_pose[0:3] + 0.8*near_limit*ray
 
         def collect(safe_range, start, end, pose, steps=3):
             current_pose = np.copy(pose)
@@ -170,10 +162,7 @@ class CameraRegistrationApplication:
                     return
 
                 self.arm.move_jp(current_pose).wait()
-                rospy.sleep(1.0)
-
-                if not self.tracker.target_visible():
-                    continue
+                rospy.sleep(0.5)
 
                 collect_point()
 
@@ -193,10 +182,14 @@ class CameraRegistrationApplication:
         limits.extend(explore_axis(current_jp, 1))
         limits.extend(explore_axis(current_jp, 2))
 
+        print(len(robot_poses))
+
         for i in range(len(limits)):
             start = i + 2 if i % 2 == 0 else i + 1 
             for j in range(start, len(limits)):
                 collect(safe_range, limits[i], limits[j], current_jp)
+
+        print(len(robot_poses))
 
         return robot_poses, target_poses
 
@@ -205,10 +198,6 @@ class CameraRegistrationApplication:
             robot_poses, target_poses
         )
         print("\nRegistration error: {}".format(error))
-
-        # self.tracker.set_robot_axes(rvec, tvec)
-        # self.tracker.display_points(object_points, rvec, tvec, (255, 0, 255))
-        # self.tracker.display_points_2d(image_points, (0, 255, 0))
 
         distance = np.linalg.norm(translation)
         print("\nTranslation distance: {} m\n".format(distance))
@@ -245,12 +234,10 @@ class CameraRegistrationApplication:
         self.done = True
 
     def _init_tracking(self):
-        tracking_parameters = vision_tracking.ObjectTracker.Parameters(max_strength=2, max_distance=0.08, unique_target=True)
-        object_tracker = vision_tracking.ObjectTracker(tracking_parameters)
         target_type = vision_tracking.ArUcoTarget(0.01, cv2.aruco.DICT_4X4_50, [0])
-        parameters = vision_tracking.VisionTracker.Parameters(1)
+        parameters = vision_tracking.VisionTracker.Parameters(5)
         self.tracker = vision_tracking.VisionTracker(
-            object_tracker, target_type, self.camera, parameters
+            target_type, self.camera, parameters
         )
 
     def run(self):
