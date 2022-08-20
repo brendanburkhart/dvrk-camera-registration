@@ -27,7 +27,7 @@ class ArUcoTarget:
         self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
         self.aruco_parameters = cv2.aruco.DetectorParameters_create()
         self.aruco_parameters.adaptiveThreshWinSizeMin = 10
-        self.aruco_parameters.adaptiveThreshWinSizeMax = 50
+        self.aruco_parameters.adaptiveThreshWinSizeMax = 120
         self.aruco_parameters.adaptiveThreshWinSizeStep = 10
         self.aruco_parameters.cornerRefinementWinSize = 15
         self.aruco_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
@@ -35,7 +35,7 @@ class ArUcoTarget:
         self.allowed_ids = allowed_ids
         self.marker_size = marker_size
 
-        self.refinement_window_interp = scipy.interpolate.interp1d([0.0, 0.01, 0.03, 0.06], [0.0, 15.0, 25.0, 40.0], kind='linear')
+        self.refinement_window_interp = scipy.interpolate.interp1d([0.0, 0.01, 0.025, 0.03, 0.06], [0.0, 15.0, 23.0, 27.0, 40.0], kind="linear", fill_value="extrapolate")
 
     def _detect(self, image, parameters):
         corners, ids, _ = cv2.aruco.detectMarkers(image, self.aruco_dict, parameters=parameters)
@@ -51,12 +51,12 @@ class ArUcoTarget:
 
         corner_refinement_window_size = self.refinement_window_interp(relative_contour_size)
         corner_refinement_window_size = int(corner_refinement_window_size)
-        #print(relative_contour_size, corner_refinement_window_size)
+        # print(relative_contour_size, corner_refinement_window_size)
 
         refined_parameters = cv2.aruco.DetectorParameters_create()
-        refined_parameters.adaptiveThreshWinSizeMin = 10
-        refined_parameters.adaptiveThreshWinSizeMax = 50
-        refined_parameters.adaptiveThreshWinSizeStep = 10
+        refined_parameters.adaptiveThreshWinSizeMin = self.aruco_parameters.adaptiveThreshWinSizeMin
+        refined_parameters.adaptiveThreshWinSizeMax = self.aruco_parameters.adaptiveThreshWinSizeMax
+        refined_parameters.adaptiveThreshWinSizeStep = self.aruco_parameters.adaptiveThreshWinSizeStep
         refined_parameters.cornerRefinementWinSize = corner_refinement_window_size
         refined_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
@@ -106,13 +106,14 @@ class VisionTracker:
         if self.target is not None:
             cv2.drawContours(image, [np.int0(self.target)], -1, (255, 0, 255), 3)
 
-    def display_point(self, point):
-        self.displayed_points.append(point)
+    def display_point(self, point3d, color, size=3):
+        point2d = self.camera.project_points(np.array([point3d]), np.zeros(3), np.zeros(3))
+        self.displayed_points.append((point2d[0], color, size))
 
     def draw_points(self, frame):
-        for point in self.displayed_points:
+        for point, color, size in self.displayed_points:
             position = tuple(np.int0(point))
-            cv2.circle(frame, position, radius=3, color=(255, 0, 255), thickness=cv2.FILLED)
+            cv2.circle(frame, position, radius=size, color=color, thickness=cv2.FILLED)
 
     def _add_image(self, image):
         # replace old image if not read yet
@@ -147,6 +148,11 @@ class VisionTracker:
 
                 if self._should_run_pose_acquisition:
                     self._run_target_pose_acquisition(frame)
+                elif hasattr(self, "axes"):
+                    cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, self.axes[0], self.axes[1], 0.01)
+                    self.camera.publish_pose(self.axes[0], self.axes[1])
+                else:
+                    self.camera.publish_no_pose()
 
                 self.draw_points(frame)
                 cv2.imshow(self.window_title, frame)
@@ -173,6 +179,8 @@ class VisionTracker:
     def _run_target_pose_acquisition(self, frame):
         if self.target is not None:
             rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(np.array([self.target]), self.target_type.marker_size, self.camera.camera_matrix, self.camera.no_distortion)
+            rotation_, _ = cv2.Rodrigues(rvecs[0])
+            self.camera.publish_pose(rotation_, tvecs[0, 0])
             cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, rvecs[0], tvecs[0], 0.01)
             self.samples.append((rvecs[0], tvecs[0, 0]))
 
@@ -186,15 +194,20 @@ class VisionTracker:
                 position_std = np.max(np.std(positions, axis=0))
                 rotation_std = np.max(np.std(rvecs, axis=0))
 
-                if position_std < 1e-3 and rotation_std < 1e-2:
+                if position_std < 5e-3 and rotation_std < 5e-2:
                     self._acquired_pose = (rotation, position)
+                    self.high_variance = False
                 else:
-                    print("High variance: P,R std: {}, {}".format(position_std, rotation_std))
+                    self.high_variance = True
+
+    def set_axes(self, pose):
+        self.axes = pose
 
     # Get pose of target
     def acquire_pose(self, timeout=None):
         self._acquired_pose = None
         self.samples = []
+        self.high_variance = False
 
         start = time.time()
         self._should_run_pose_acquisition = True
@@ -206,7 +219,8 @@ class VisionTracker:
                 if early_timeout:
                     break
                 elif elapsed > timeout:
-                    print("Timeout!")
+                    if self.high_variance:
+                        print("Discarding sample due to high variance in measured target pose")
                     break
 
             if self._acquired_pose is not None:

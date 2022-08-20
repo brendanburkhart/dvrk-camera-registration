@@ -15,14 +15,27 @@ from dvrk.arm import *
 
 from cisst_msgs.srv import QueryForwardKinematics, QueryForwardKinematicsRequest
 import rospy
-import numpy
 from geometry_msgs.msg import Pose, Point, Quaternion
+import math
 import numpy as np
+import crtk
 
 class PSM(arm):
+    class Jaw:
+        def __init__(self, ros_namespace, expected_interval, operating_state_instance):
+            self._crtk_utils = crtk.utils(self, ros_namespace, expected_interval, operating_state_instance)
+            self._crtk_utils.add_move_jp()
+
+        def close(self):
+            return self.move_jp(np.array(math.radians(-20.0)))
+
+        def open(self, angle=math.radians(60.0)):
+            return self.move_jp(np.array(angle))
+
     # initialize the robot
     def __init__(self, arm_name, ros_namespace = "", expected_interval = 0.01):
         self._arm__init_arm(arm_name, ros_namespace, expected_interval)
+        self.jaw = PSM.Jaw(self.namespace() + "/jaw", expected_interval, operating_state_instance=self)
 
         query_cp_name = "{}/local/query_cp".format(self.namespace())
         self.local_query_cp = rospy.ServiceProxy(query_cp_name, QueryForwardKinematics)
@@ -45,6 +58,9 @@ class PSM(arm):
     def clear_base_frame(self):
         identity = Pose(Point(0.0, 0.0, 0.0), Quaternion(0.0, 0.0, 0.0, 1.0))
         self._set_base_frame_pub.publish(identity)
+
+    def set_base_frame(self, pose):
+        self._set_base_frame_pub.publish(pose)
 
     def forward_kinematics(self, joint_position):
         pad_length = max(0, 8-len(joint_position))
@@ -73,4 +89,3 @@ class PSM(arm):
 
         pose[2] = self.cartesian_insertion_minimum
         return self.move_jp(pose)
-

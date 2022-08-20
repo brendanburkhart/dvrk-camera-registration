@@ -39,6 +39,7 @@ class Camera:
 
         self.camera_info_topic = camera_info_topic
         self.image_topic = image_topic
+        self.pose_publisher = rospy.Publisher("/vision_target_pose", PoseArray, queue_size=1)
 
     def set_callback(self, image_callback):
         if self.image_callback is not None and image_callback is not None:
@@ -54,6 +55,26 @@ class Camera:
 
     def get_camera_frame(self):
         return self.camera_frame
+
+    def publish_no_pose(self):
+        poses = PoseArray()
+        poses.header.frame_id = self.camera_frame
+        poses.header.stamp = rospy.Time.now()
+        self.pose_publisher.publish(poses)
+
+    def publish_pose(self, rotation, tvec):
+        matrix = np.eye(4)
+        matrix[0:3, 0:3] = rotation
+        q = tf.transformations.quaternion_from_matrix(matrix)
+        pose = Pose()
+        pose.position = Point(tvec[0], tvec[1], tvec[2])
+        pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        poses = PoseArray()
+        poses.poses.append(pose)
+        poses.header.frame_id = self.camera_frame
+        poses.header.stamp = rospy.Time.now()
+
+        self.pose_publisher.publish(poses)
 
     def _info_callback(self, info_msg):
         projection_matrix = np.array(info_msg.P).reshape((3, 4))
@@ -87,12 +108,12 @@ class Camera:
         return ok, reprojection_error, rotation, translation
 
     def calibrate_pose(self, robot_poses, target_poses):
-        robot_poses_r = np.array([p[0] for p in robot_poses], dtype=np.float32)
-        robot_poses_t = np.array([p[1] for p in robot_poses], dtype=np.float32)
-        target_poses_r = np.array([p[0] for p in target_poses], dtype=np.float32)
-        target_poses_t = np.array([p[1] for p in target_poses], dtype=np.float32)
+        robot_poses_r = np.array([p[0] for p in robot_poses], dtype=np.float64)
+        robot_poses_t = np.array([p[1] for p in robot_poses], dtype=np.float64)
+        target_poses_r = np.array([p[0] for p in target_poses], dtype=np.float64)
+        target_poses_t = np.array([p[1] for p in target_poses], dtype=np.float64)
 
-        rotation, translation = cv2.calibrateHandEye(robot_poses_r, robot_poses_t, target_poses_r, target_poses_t, method=cv2.CALIB_HAND_EYE_PARK)
+        rotation, translation = cv2.calibrateHandEye(robot_poses_r, robot_poses_t, target_poses_r, target_poses_t, method=cv2.CALIB_HAND_EYE_HORAUD)
 
         def to_homogenous(rotation, translation):
             X = np.eye(4)
@@ -112,8 +133,6 @@ class Camera:
         transforms = np.array(transforms)
 
         error = np.std(transforms - np.mean(transforms))
-
-        # bad: 0.0013
 
         return error, rotation, translation
 
