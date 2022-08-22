@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 # Author: Brendan Burkhart
 # Date: 2022-06-21
 
@@ -22,6 +20,7 @@ import scipy
 import camera
 import time
 
+
 class ArUcoTarget:
     def __init__(self, marker_size, aruco_dict, allowed_ids):
         self.aruco_dict = cv2.aruco.Dictionary_get(aruco_dict)
@@ -35,10 +34,25 @@ class ArUcoTarget:
         self.allowed_ids = allowed_ids
         self.marker_size = marker_size
 
-        self.refinement_window_interp = scipy.interpolate.interp1d([0.0, 0.01, 0.025, 0.03, 0.06], [0.0, 15.0, 23.0, 27.0, 40.0], kind="linear", fill_value="extrapolate")
+        # TODO
+        # self.refinement_window_interp = scipy.interpolate.interp1d(
+        #     [0.0, 0.01, 0.025, 0.03, 0.06],
+        #     [0.0, 15.0, 23.0, 20.0, 40.0],
+        #     kind="linear",
+        #     fill_value="extrapolate",
+        # )
+
+        self.refinement_window_interp = scipy.interpolate.interp1d(
+            [0.0, 100.0, 150.0, 200.0],
+            [0.0, 6.0, 15.0, 20.0],
+            kind="linear",
+            fill_value="extrapolate",
+        )
 
     def _detect(self, image, parameters):
-        corners, ids, _ = cv2.aruco.detectMarkers(image, self.aruco_dict, parameters=parameters)
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            image, self.aruco_dict, parameters=parameters
+        )
 
         ids = [x[0] for x in ids] if ids is not None else []
         corners = [corners[i][0] for i in range(len(ids)) if ids[i] in self.allowed_ids]
@@ -46,18 +60,22 @@ class ArUcoTarget:
         return np.array(corners[0]) if len(corners) == 1 else None
 
     def _refine_detection(self, image, target):
-        image_size = image.shape[0]*image.shape[1]
-        relative_contour_size = cv2.contourArea(target)/image_size
-
-        corner_refinement_window_size = self.refinement_window_interp(relative_contour_size)
-        corner_refinement_window_size = int(corner_refinement_window_size)
-        # print(relative_contour_size, corner_refinement_window_size)
+        contour_size = math.sqrt(cv2.contourArea(target))
+        window_size = int(self.refinement_window_interp(contour_size))
+        # TODO
+        #print(contour_size, window_size)
 
         refined_parameters = cv2.aruco.DetectorParameters_create()
-        refined_parameters.adaptiveThreshWinSizeMin = self.aruco_parameters.adaptiveThreshWinSizeMin
-        refined_parameters.adaptiveThreshWinSizeMax = self.aruco_parameters.adaptiveThreshWinSizeMax
-        refined_parameters.adaptiveThreshWinSizeStep = self.aruco_parameters.adaptiveThreshWinSizeStep
-        refined_parameters.cornerRefinementWinSize = corner_refinement_window_size
+        refined_parameters.adaptiveThreshWinSizeMin = (
+            self.aruco_parameters.adaptiveThreshWinSizeMin
+        )
+        refined_parameters.adaptiveThreshWinSizeMax = (
+            self.aruco_parameters.adaptiveThreshWinSizeMax
+        )
+        refined_parameters.adaptiveThreshWinSizeStep = (
+            self.aruco_parameters.adaptiveThreshWinSizeStep
+        )
+        refined_parameters.cornerRefinementWinSize = window_size
         refined_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
         return self._detect(image, refined_parameters)
@@ -69,6 +87,7 @@ class ArUcoTarget:
             return self._refine_detection(image, target)
         else:
             return None
+
 
 class VisionTracker:
     class Parameters:
@@ -107,7 +126,9 @@ class VisionTracker:
             cv2.drawContours(image, [np.int0(self.target)], -1, (255, 0, 255), 3)
 
     def display_point(self, point3d, color, size=3):
-        point2d = self.camera.project_points(np.array([point3d]), np.zeros(3), np.zeros(3))
+        point2d = self.camera.project_points(
+            np.array([point3d]), np.zeros(3), np.zeros(3)
+        )
         self.displayed_points.append((point2d[0], color, size))
 
     def draw_points(self, frame):
@@ -140,16 +161,25 @@ class VisionTracker:
                 try:
                     frame = self.image_queue.get(block=True, timeout=1)
                 except queue.Empty:
-                    print("No camera image available, waited for 1 second")
+                    print("\nNo camera image available, waited for 1 second\n")
                     self._quit_handler()
                     continue
 
                 self._process_targets(frame)
+                # TODO
+                #self._run_target_pose_acquisition(frame)
 
                 if self._should_run_pose_acquisition:
                     self._run_target_pose_acquisition(frame)
                 elif hasattr(self, "axes"):
-                    cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, self.axes[0], self.axes[1], 0.01)
+                    cv2.drawFrameAxes(
+                        frame,
+                        self.camera.camera_matrix,
+                        self.camera.no_distortion,
+                        self.axes[0],
+                        self.axes[1],
+                        0.01,
+                    )
                     self.camera.publish_pose(self.axes[0], self.axes[1])
                 else:
                     self.camera.publish_no_pose()
@@ -178,10 +208,22 @@ class VisionTracker:
 
     def _run_target_pose_acquisition(self, frame):
         if self.target is not None:
-            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(np.array([self.target]), self.target_type.marker_size, self.camera.camera_matrix, self.camera.no_distortion)
+            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                np.array([self.target]),
+                self.target_type.marker_size,
+                self.camera.camera_matrix,
+                self.camera.no_distortion,
+            )
             rotation_, _ = cv2.Rodrigues(rvecs[0])
             self.camera.publish_pose(rotation_, tvecs[0, 0])
-            cv2.drawFrameAxes(frame, self.camera.camera_matrix, self.camera.no_distortion, rvecs[0], tvecs[0], 0.01)
+            cv2.drawFrameAxes(
+                frame,
+                self.camera.camera_matrix,
+                self.camera.no_distortion,
+                rvecs[0],
+                tvecs[0],
+                0.5*self.target_type.marker_size,
+            )
             self.samples.append((rvecs[0], tvecs[0, 0]))
 
             if len(self.samples) >= self.parameters.pose_samples:
@@ -215,12 +257,10 @@ class VisionTracker:
         while not self.should_stop:
             if timeout is not None:
                 elapsed = time.time() - start
-                early_timeout = len(self.samples) == 0 and elapsed > 0.25*timeout
+                early_timeout = len(self.samples) == 0 and elapsed > 0.25 * timeout
                 if early_timeout:
                     break
                 elif elapsed > timeout:
-                    if self.high_variance:
-                        print("Discarding sample due to high variance in measured target pose")
                     break
 
             if self._acquired_pose is not None:
@@ -229,3 +269,16 @@ class VisionTracker:
 
         self._should_run_pose_acquisition = False
         return False, None
+
+    def is_target_visible(self, timeout=0.1):
+        start = time.time()
+
+        while not self.should_stop:
+            elapsed = time.time() - start
+            if elapsed > timeout:
+                return False
+
+            if self.target is not None:
+                return True
+
+        return False

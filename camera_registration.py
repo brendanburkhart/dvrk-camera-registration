@@ -24,7 +24,7 @@ import sys
 from scipy.spatial.transform import Rotation
 
 from camera import Camera
-import pose_generator
+import convex_hull
 import vision_tracking
 
 
@@ -65,7 +65,9 @@ class CameraRegistrationApplication:
                 position = np.array([pose[0], pose[1], pose[2]])
 
                 # make list sparser by ensuring >2mm separation
-                euclidean = lambda x: np.array([math.sin(x[0])*x[2], math.sin(x[1])*x[2], math.cos(x[2])])
+                euclidean = lambda x: np.array(
+                    [math.sin(x[0]) * x[2], math.sin(x[1]) * x[2], math.cos(x[2])]
+                )
                 distance = lambda a, b: np.linalg.norm(euclidean(a) - euclidean(b))
                 if len(hull_points) == 0 or distance(position, hull_points[-1]) > 0.005:
                     hull_points.append(position)
@@ -81,37 +83,76 @@ class CameraRegistrationApplication:
             if not self.ok:
                 return False, None
 
-            hull = pose_generator.convex_hull(hull_points)
+            hull = convex_hull.convex_hull(hull_points)
             if hull is None:
                 print("Insufficient range of motion, please continue")
             else:
-                return self.ok, hull
+                break
+
+        print("Range of motion displayed in plot, close plot window to continue")
+        convex_hull.display_hull(hull)
+        return self.ok, hull
+
+    # Make sure target is visible and arm is within range of motion
+    def ensure_target_visible(self, safe_range):
+        self.done = True # run first check immeditately
+        first_check = True
+
+        while self.ok:
+            rospy.sleep(0.25)
+
+            if not self.done:
+                continue
+
+            jp = np.copy(self.arm.measured_jp())
+            visible = self.tracker.is_target_visible(timeout=1)
+            in_rom = convex_hull.in_hull(safe_range, jp)
+
+            if not visible:
+                self.done = False
+                if first_check:
+                    print(
+                        "\nPlease position arm so ArUco target is visible, facing towards camera, and roughly centered within camera's view\n"
+                    )
+                    first_check = False
+                else:
+                    print(
+                        "Target is not visible, please re-position. Make sure target is not too close"
+                    )
+                print("Press enter or 'd' when done")
+            elif not in_rom:
+                self.done = False
+                print(
+                    "Arm is not within user supplied range of motion, please re-position"
+                )
+            else:
+                return True, jp
+
+        return False, None
 
     # From starting position within view of camera, determine the camera's
     # field of view via exploration while staying within safe range of motion
-    def explore_camera_view(self, safe_range):
-        start_jp = np.copy(self.arm.measured_jp())
+    # Once field of view is found, collect additional pose samples
+    def collect_data(self, safe_range, start_jp, edge_samples=4):
         current_jp = np.copy(start_jp)
         current_jp[4:6] = np.zeros(2)
-
-        shaft_rotation = current_jp[3]
 
         target_poses = []
         robot_poses = []
 
-        print("Range of motion displayed in plot, close plot to continue")
-        pose_generator.display_hull(safe_range)
+        self.arm.jaw.close()
 
-        if not pose_generator.in_hull(safe_range, current_jp):
-            current_jp[0:3] = pose_generator.centroid(safe_range)
-            print("WARNING: starting pose not within safe range of motion, moving to ROM centroid")
-
-        print()
-
-        def collect_point():
+        def measure_pose(joint_pose):
             nonlocal target_poses
             nonlocal robot_poses
-            
+
+            if not convex_hull.in_hull(safe_range, joint_pose):
+                print("Safety limit reached!")
+                return False
+
+            self.arm.move_jp(joint_pose).wait()
+            rospy.sleep(0.5)
+
             ok, target_pose = self.tracker.acquire_pose(timeout=4.0)
             if not ok:
                 return False
@@ -131,24 +172,17 @@ class CameraRegistrationApplication:
             start_pose = np.copy(pose)
             current_pose = np.copy(pose)
 
-            far_limit = pose_generator.intersection(safe_range, start_pose[0:3], ray)
+            far_limit = convex_hull.intersection(safe_range, start_pose[0:3], ray)
             near_limit = 0.0
 
             for i in range(max_steps):
                 if not self.ok:
                     break
 
-                mid_point = 0.5*(near_limit + far_limit)
-                current_pose[0:3] = start_pose[0:3] + mid_point*ray
-                if not pose_generator.in_hull(safe_range, current_pose):
-                    print("Safety limit reached!")
-                    far_limit = mid_point
-                    continue
+                mid_point = 0.5 * (near_limit + far_limit)
+                current_pose[0:3] = start_pose[0:3] + mid_point * ray
 
-                self.arm.move_jp(current_pose).wait()
-                rospy.sleep(0.05)
-
-                ok = collect_point()
+                ok = measure_pose(current_pose)
                 if ok:
                     near_limit = mid_point
                     self.tracker.display_point(target_poses[-1][1], (255, 0, 255))
@@ -159,23 +193,38 @@ class CameraRegistrationApplication:
                 if i + 1 >= min_steps and near_limit > 0:
                     break
 
-            end_point = start_pose[0:3] + 0.9*near_limit*ray
+            end_point = start_pose[0:3] + 0.9 * near_limit * ray
             if len(target_poses) > 0:
                 self.tracker.display_point(target_poses[-1][1], (255, 123, 66), size=7)
 
             return end_point
 
-        def collect(safe_range, pose):
-            if not pose_generator.in_hull(safe_range, pose):
-                print("Safety limit reached!")
-                return
+        def collect(poses, tool_shaft_rotation=math.pi / 10):
+            print("Progress: 0%", end="\r")
+            for i, pose in enumerate(poses):
+                if not self.ok or rospy.is_shutdown():
+                    return
 
-            ok = collect_point()
-            if ok:
-                self.tracker.display_point(target_poses[-1][1], (255, 255, 0))
-            else:
-                self.tracker.display_point(target_poses[-1][1], (0, 0, 255))
+                rotation_direction = 1 if i % 2 == 0 else -1
+                pose[3] = pose[3] + rotation_direction * tool_shaft_rotation
+                shaft_rotations = [
+                    pose[3] + rotation_direction * tool_shaft_rotation,
+                    pose[3] - rotation_direction * tool_shaft_rotation,
+                ]
 
+                for shaft_rotation in shaft_rotations:
+                    pose[3] = shaft_rotation
+                    ok = measure_pose(pose)
+                    if ok:
+                        self.tracker.display_point(target_poses[-1][1], (255, 255, 0))
+                        break
+
+                print(
+                    "Progress: {}%".format(int(100 * (i + 1) / len(sample_poses))),
+                    end="\r",
+                )
+
+        print()
         print("Determining limits of camera view...")
         print("Progress: 0%", end="\r")
         limits = []
@@ -183,38 +232,28 @@ class CameraRegistrationApplication:
         for axis in range(3):
             ray = np.array([0, 0, 0])
             for direction in [1, -1]:
+                if not self.ok:
+                    return None
+
                 ray[axis] = direction
                 limits.append(bisect_camera_view(current_jp, ray))
-                print("Progress: {}%".format(int(100*len(limits)/6)), end="\r")
+                print("Progress: {}%".format(int(100 * len(limits) / 6)), end="\r")
         print("\n")
 
-        print("Collecting pose data...")
-        print("Progress: 0%", end="\r")
+        # Limits found above define octahedron, take samples along all 12 edges
         sample_poses = []
-        tool_shaft_rotation = math.pi/10
         for i in range(len(limits)):
-            start = i + 2 if i % 2 == 0 else i + 1 
+            start = i + 2 if i % 2 == 0 else i + 1
             for j in range(start, len(limits)):
-                a = self.arm.forward_kinematics(limits[i])
-                b = self.arm.forward_kinematics(limits[j])
-
-                size = max(0.01, np.linalg.norm(a - b))
-                size = min(size, 0.08)
-                size = (size-0.01)/0.06
-                samples = round(3*size + 3)
-
-                for t in np.linspace(1/(samples+1), 1-1/(samples+1), samples):
+                for t in np.linspace(
+                    1 / (edge_samples + 1), 1 - 1 / (edge_samples + 1), edge_samples
+                ):
                     pose = np.copy(current_jp)
-                    pose[0:3] = limits[j] + t*(limits[i] - limits[j])
-                    pose[3] = current_jp + tool_shaft_rotation
-                    sample_poses.append(np.copy(pose))
-                    pose[3] = current_jp - tool_shaft_rotation
-                    sample_poses.append(np.copy(pose))
+                    pose[0:3] = limits[j] + t * (limits[i] - limits[j])
+                    sample_poses.append(pose)
 
-        for i, pose in enumerate(sample_poses):
-            collect(safe_range, pose)
-            s += samples
-            print("Progress: {}%".format(int(100*(i+1)/len(sample_poses))), end="\r")
+        print("Collecting pose data...")
+        collect(sample_poses)
         print("\n")
 
         print("Data collection complete\n")
@@ -228,37 +267,16 @@ class CameraRegistrationApplication:
         if error < 1e-4:
             print("Registration error ({:.3e}) is within normal range".format(error))
         else:
-            print("WARNING: registration error ({:.3e}) is unusually high! Should generally be <0.00005".format(error))
+            print(
+                "WARNING: registration error ({:.3e}) is unusually high! Should generally be <0.00005".format(
+                    error
+                )
+            )
 
         distance = np.linalg.norm(translation)
-        print("Measured distance from RCM to camera origin: {:.3f} m\n".format(distance))
-
-        # def to_homogenous(rotation, translation):
-        #     X = np.eye(4)
-        #     X[0:3, 0:3] = rotation
-        #     X[0:3, 3] = translation.reshape((3,))
-        #     return X
-
-        # def to_matrix(pose):
-        #     rotation_quaternion = Rotation.from_quat(pose.M.GetQuaternion())
-        #     _rotation = np.float64(rotation_quaternion.as_matrix())
-        #     translation = np.array([pose.p[0], pose.p[1], pose.p[2]], dtype=np.float64)
-        #     return to_homogenous(_rotation, translation)
-
-        # AX = to_homogenous(robot_poses[0][0], robot_poses[0][1])
-        # BX = to_homogenous(rotation, translation)
-        # CX = to_homogenous(target_poses[0][0], target_poses[0][1])
-        # TX = np.matmul(AX, np.matmul(BX, CX))
-
-        # self.done = False
-        # print("Press enter or 'd' to continue")
-        # while not self.done and self.ok:
-        #     rospy.sleep(0.25)
-        #     A = to_matrix(self.arm.local.measured_cp())
-        #     B = to_homogenous(rotation, translation)
-        #     t = np.matmul(np.linalg.inv(B), np.matmul(A, TX))
-
-        #     self.tracker.set_axes((t[0:3, 0:3], t[0:3, 3]))
+        print(
+            "Measured distance from RCM to camera origin: {:.3f} m\n".format(distance)
+        )
 
         return self.ok, rotation, translation
 
@@ -275,9 +293,13 @@ class CameraRegistrationApplication:
             "transform": transform.tolist(),
         }
 
+        output = '"base-frame": {}'.format(json.dumps(base_frame))
+
         with open(file_name, "w") as f:
-            json.dump(base_frame, f)
+            f.write(output)
             f.write("\n")
+
+        print("Hand-eye calibration saved to {}".format(file_name))
 
     # Exit key (q/ESCAPE) handler for GUI
     def _on_quit(self):
@@ -290,7 +312,9 @@ class CameraRegistrationApplication:
         self.done = True
 
     def _init_tracking(self):
-        target_type = vision_tracking.ArUcoTarget(self.marker_size, cv2.aruco.DICT_4X4_50, [0])
+        target_type = vision_tracking.ArUcoTarget(
+            self.marker_size, cv2.aruco.DICT_4X4_50, [0]
+        )
         parameters = vision_tracking.VisionTracker.Parameters(4)
         self.tracker = vision_tracking.VisionTracker(
             target_type, self.camera, parameters
@@ -313,9 +337,11 @@ class CameraRegistrationApplication:
             if not self.ok or not ok:
                 return
 
-            print("\nPlease position arm so ArUco target is visible, facing towards camera, and roughly centered within camera's view\n")
+            ok, start_jp = self.ensure_target_visible(safe_range)
+            if not self.ok or not ok:
+                return
 
-            data = self.explore_camera_view(safe_range)
+            data = self.collect_data(safe_range, start_jp)
             if not self.ok:
                 return
 
@@ -330,7 +356,9 @@ class CameraRegistrationApplication:
 
             self.tracker.stop()
 
-            self.save_registration(rvec, tvec, "./{}_registration.json".format(self.arm.name))
+            self.save_registration(
+                rvec, tvec, "./{}_registration.json".format(self.arm.name)
+            )
 
         finally:
             self.tracker.stop()
@@ -384,7 +412,9 @@ def main():
     args = parser.parse_args(argv[1:])  # skip argv[0], script name
 
     camera = Camera(args.camera_info_topic, args.camera_image_topic)
-    application = CameraRegistrationApplication(args.arm, args.marker_size, args.interval, camera)
+    application = CameraRegistrationApplication(
+        args.arm, args.marker_size, args.interval, camera
+    )
     application.run()
 
 

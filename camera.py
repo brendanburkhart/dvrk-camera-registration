@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-# Author: Brendan Burkhart 
+# Author: Brendan Burkhart
 # Date: 2022-06-21
 
 # (C) Copyright 2022 Johns Hopkins University (JHU), All Rights Reserved.
@@ -39,7 +39,9 @@ class Camera:
 
         self.camera_info_topic = camera_info_topic
         self.image_topic = image_topic
-        self.pose_publisher = rospy.Publisher("/vision_target_pose", PoseArray, queue_size=1)
+        self.pose_publisher = rospy.Publisher(
+            "/vision_target_pose", PoseArray, queue_size=1
+        )
 
     def set_callback(self, image_callback):
         if self.image_callback is not None and image_callback is not None:
@@ -50,18 +52,24 @@ class Camera:
             self.image_callback = None
         else:
             self.image_callback = image_callback
-            self.info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo, self._info_callback)
-            self.image_subscriber = rospy.Subscriber(self.image_topic, Image, self._image_callback)
+            self.info_subscriber = rospy.Subscriber(
+                self.camera_info_topic, CameraInfo, self._info_callback
+            )
+            self.image_subscriber = rospy.Subscriber(
+                self.image_topic, Image, self._image_callback
+            )
 
     def get_camera_frame(self):
         return self.camera_frame
 
+    # TODO
     def publish_no_pose(self):
         poses = PoseArray()
         poses.header.frame_id = self.camera_frame
         poses.header.stamp = rospy.Time.now()
         self.pose_publisher.publish(poses)
 
+    # TODO
     def publish_pose(self, rotation, tvec):
         matrix = np.eye(4)
         matrix[0:3, 0:3] = rotation
@@ -82,7 +90,7 @@ class Camera:
         self.camera_frame = info_msg.header.frame_id
 
     def _image_callback(self, image_msg):
-        callback = self.image_callback # copy to prevent race
+        callback = self.image_callback  # copy to prevent race
         if self.camera_matrix is None or callback is None:
             return
 
@@ -90,30 +98,47 @@ class Camera:
         callback(cv_image)
 
     def project_points(self, object_points, rodrigues_rotation, translation_vector):
-        image_points, _ = cv2.projectPoints(object_points, rodrigues_rotation, translation_vector, self.camera_matrix, self.no_distortion)
-        
+        image_points, _ = cv2.projectPoints(
+            object_points,
+            rodrigues_rotation,
+            translation_vector,
+            self.camera_matrix,
+            self.no_distortion,
+        )
+
         # opencv double-nests the points for some reason, i.e. each point is array([[x, y]])
         image_points = image_points.reshape((-1, 2))
 
         return image_points
 
     def get_pose(self, object_points, image_points):
-        ok, rotation, translation = cv2.solvePnP(object_points, image_points, self.camera_matrix, self.no_distortion)
+        ok, rotation, translation = cv2.solvePnP(
+            object_points, image_points, self.camera_matrix, self.no_distortion
+        )
         if not ok:
             return ok, 0.0, rotation, translation
 
         projected_points = self.project_points(object_points, rotation, translation)
-        reprojection_error = np.mean(np.linalg.norm(image_points - projected_points, axis=1))
+        reprojection_error = np.mean(
+            np.linalg.norm(image_points - projected_points, axis=1)
+        )
 
         return ok, reprojection_error, rotation, translation
 
+    # TODO
     def calibrate_pose(self, robot_poses, target_poses):
         robot_poses_r = np.array([p[0] for p in robot_poses], dtype=np.float64)
         robot_poses_t = np.array([p[1] for p in robot_poses], dtype=np.float64)
         target_poses_r = np.array([p[0] for p in target_poses], dtype=np.float64)
         target_poses_t = np.array([p[1] for p in target_poses], dtype=np.float64)
 
-        rotation, translation = cv2.calibrateHandEye(robot_poses_r, robot_poses_t, target_poses_r, target_poses_t, method=cv2.CALIB_HAND_EYE_HORAUD)
+        rotation, translation = cv2.calibrateHandEye(
+            robot_poses_r,
+            robot_poses_t,
+            target_poses_r,
+            target_poses_t,
+            method=cv2.CALIB_HAND_EYE_HORAUD,
+        )
 
         def to_homogenous(rotation, translation):
             X = np.eye(4)
