@@ -19,6 +19,89 @@ import queue
 import scipy
 import camera
 import time
+from enum import Enum
+import collections
+
+
+class MessageManager:
+    class Level(Enum):
+        INFO = 0
+        WARNING = 1
+        ERROR = 2
+
+    def __init__(self, buffer_size=100, font_size=0.5):
+        self.messages = collections.deque(maxlen=buffer_size)
+        self.messages_lock = threading.Lock()
+
+        self.padding = 15
+        self.font_size = font_size
+        self.font = cv2.FONT_HERSHEY_DUPLEX
+
+        self.current_progress = 0
+        self.in_progress = False
+
+    def _add(self, level, message):
+        print(message)
+
+        messages = message.split("\n")
+
+        with self.messages_lock:
+            self.in_progress = False
+            for message in messages:
+                self.messages.appendleft((level, message))
+
+    def info(self, message):
+        self._add(MessageManager.Level.INFO, message)
+
+    def warn(self, message):
+        self._add(MessageManager.Level.WARNING, message)
+
+    def error(self, message):
+        self._add(MessageManager.Level.ERROR, message)
+
+    def line_break(self):
+        self._add(MessageManager.Level.INFO, "")
+
+    def progress(self, progress):
+        self.current_progress = progress
+        with self.messages_lock:
+            if self.in_progress:
+                self.messages.popleft()
+
+        percent = int(100 * self.current_progress)
+
+        with self.messages_lock:
+            self.messages.appendleft(
+                (MessageManager.Level.INFO, "Progress: {}%".format(percent))
+            )
+            self.in_progress = self.current_progress != 1.0
+
+    def _message_color(self, level):
+        if level == MessageManager.Level.INFO:
+            return (255, 255, 255)  # white
+        elif level == MessageManager.Level.WARNING:
+            return (80, 255, 255)  # yellow
+        else:
+            return (80, 80, 255)  # red
+
+    def render(self, image, area):
+        start = area[0] + area[2] - self.padding
+
+        with self.messages_lock:
+            for level, line in self.messages:
+                size, _ = cv2.getTextSize(line, self.font, self.font_size, 1)
+                location = (area[1] + self.padding, start)
+                cv2.putText(
+                    image,
+                    line,
+                    location,
+                    fontFace=self.font,
+                    fontScale=self.font_size,
+                    color=self._message_color(level),
+                    thickness=1,
+                    lineType=cv2.LINE_AA,
+                )
+                start -= size[1] + self.padding
 
 
 class ArUcoTarget:
@@ -63,7 +146,7 @@ class ArUcoTarget:
         contour_size = math.sqrt(cv2.contourArea(target))
         window_size = int(self.refinement_window_interp(contour_size))
         # TODO
-        #print(contour_size, window_size)
+        # print(contour_size, window_size)
 
         refined_parameters = cv2.aruco.DetectorParameters_create()
         refined_parameters.adaptiveThreshWinSizeMin = (
@@ -97,11 +180,13 @@ class VisionTracker:
     def __init__(
         self,
         target_type,
+        message_manager,
         camera: camera.Camera,
         parameters=Parameters(),
         window_title="Vision tracking",
     ):
         self.target_type = target_type
+        self.message_manager = message_manager
         self.parameters = parameters
         self.window_title = window_title
         self.camera = camera
@@ -145,6 +230,33 @@ class VisionTracker:
 
         self.image_queue.put(image, block=False)
 
+    def _gui_layout(self, image):
+        image_size = (image.shape[1], image.shape[0])
+        window_rect = cv2.getWindowImageRect(self.window_title)
+        window_size = (window_rect[2], window_rect[3])
+
+        # Calculate area available for message output, and image resizing factor
+        message_output_height = int(0.25 * window_size[1])
+        display_size = (window_size[0], window_size[1] - message_output_height)
+        scale = min(display_size[0] / image_size[0], display_size[1] / image_size[1])
+        new_size = (int(scale * image_size[0]), int(scale * image_size[1]))
+
+        padded_image = np.zeros((window_size[1], window_size[0], 3), dtype=np.uint8)
+
+        # Resize image and center within display area
+        offset_x = (display_size[0] - new_size[0]) // 2
+        offset_y = message_output_height + (display_size[1] - new_size[1]) // 2
+        padded_image[
+            offset_y : offset_y + new_size[1], offset_x : offset_x + new_size[0]
+        ] = cv2.resize(image, new_size, 0, 0, cv2.INTER_CUBIC)
+
+        # Add message output onto allocated area
+        self.message_manager.render(
+            padded_image, (0, 0, message_output_height, window_size[1])
+        )
+
+        return padded_image
+
     # In background, run object tracking and display video
     def start(self, enter_handler, quit_handler):
         self.should_stop = False
@@ -167,7 +279,7 @@ class VisionTracker:
 
                 self._process_targets(frame)
                 # TODO
-                #self._run_target_pose_acquisition(frame)
+                # self._run_target_pose_acquisition(frame)
 
                 if self._should_run_pose_acquisition:
                     self._run_target_pose_acquisition(frame)
@@ -222,7 +334,7 @@ class VisionTracker:
                 self.camera.no_distortion,
                 rvecs[0],
                 tvecs[0],
-                0.5*self.target_type.marker_size,
+                0.5 * self.target_type.marker_size,
             )
             self.samples.append((rvecs[0], tvecs[0, 0]))
 

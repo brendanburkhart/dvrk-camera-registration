@@ -36,26 +36,26 @@ class CameraRegistrationApplication:
         self.arm = psm.PSM(arm_name=arm_name, expected_interval=expected_interval)
 
     def setup(self):
-        print("Enabling {}...".format(self.arm.name))
+        self.messages.info("Enabling {}...".format(self.arm.name))
         if not self.arm.enable(5):
-            print("Failed to enable {} within 10 seconds".format(self.arm.name))
+            self.messages.error("Failed to enable {} within 10 seconds".format(self.arm.name))
             return False
 
-        print("Homing {}...".format(self.arm.name))
+        self.messages.info("Homing {}...".format(self.arm.name))
         if not self.arm.home(10):
-            print("Failed to home {} within 10 seconds".format(self.arm.name))
+            self.messages.error("Failed to home {} within 10 seconds".format(self.arm.name))
             return False
 
-        print("Homing complete\n")
+        self.messages.info("Homing complete\n")
         self.arm.jaw.close().wait()
 
         return True
 
     def determine_safe_range_of_motion(self):
-        print(
+        self.messages.info(
             "Release the clutch and move the arm around to establish the area the arm can move in"
         )
-        print("Press enter or 'd' when done")
+        self.messages.info("Press enter or 'd' when done")
 
         def collect_points(hull_points):
             self.done = False
@@ -85,11 +85,11 @@ class CameraRegistrationApplication:
 
             hull = convex_hull.convex_hull(hull_points)
             if hull is None:
-                print("Insufficient range of motion, please continue")
+                self.messages.info("Insufficient range of motion, please continue")
             else:
                 break
 
-        print("Range of motion displayed in plot, close plot window to continue")
+        self.messages.info("Range of motion displayed in plot, close plot window to continue")
         convex_hull.display_hull(hull)
         return self.ok, hull
 
@@ -111,18 +111,18 @@ class CameraRegistrationApplication:
             if not visible:
                 self.done = False
                 if first_check:
-                    print(
+                    self.messages.warn(
                         "\nPlease position arm so ArUco target is visible, facing towards camera, and roughly centered within camera's view\n"
                     )
                     first_check = False
                 else:
-                    print(
+                    self.messages.warn(
                         "Target is not visible, please re-position. Make sure target is not too close"
                     )
-                print("Press enter or 'd' when done")
+                self.messages.info("Press enter or 'd' when done")
             elif not in_rom:
                 self.done = False
-                print(
+                self.messages.warn(
                     "Arm is not within user supplied range of motion, please re-position"
                 )
             else:
@@ -147,7 +147,7 @@ class CameraRegistrationApplication:
             nonlocal robot_poses
 
             if not convex_hull.in_hull(safe_range, joint_pose):
-                print("Safety limit reached!")
+                self.messages.error("Safety limit reached!")
                 return False
 
             self.arm.move_jp(joint_pose).wait()
@@ -200,7 +200,7 @@ class CameraRegistrationApplication:
             return end_point
 
         def collect(poses, tool_shaft_rotation=math.pi / 10):
-            print("Progress: 0%", end="\r")
+            self.messages.progress(0.0)
             for i, pose in enumerate(poses):
                 if not self.ok or rospy.is_shutdown():
                     return
@@ -219,14 +219,11 @@ class CameraRegistrationApplication:
                         self.tracker.display_point(target_poses[-1][1], (255, 255, 0))
                         break
 
-                print(
-                    "Progress: {}%".format(int(100 * (i + 1) / len(sample_poses))),
-                    end="\r",
-                )
+                self.messages.progress((i+1)/len(sample_poses))
 
-        print()
-        print("Determining limits of camera view...")
-        print("Progress: 0%", end="\r")
+        self.messages.line_break()
+        self.messages.info("Determining limits of camera view...")
+        self.messages.progress(0.0)
         limits = []
 
         for axis in range(3):
@@ -237,8 +234,8 @@ class CameraRegistrationApplication:
 
                 ray[axis] = direction
                 limits.append(bisect_camera_view(current_jp, ray))
-                print("Progress: {}%".format(int(100 * len(limits) / 6)), end="\r")
-        print("\n")
+                self.messages.progress(len(limits) / 6)
+        self.messages.line_break()
 
         # Limits found above define octahedron, take samples along all 12 edges
         sample_poses = []
@@ -252,11 +249,11 @@ class CameraRegistrationApplication:
                     pose[0:3] = limits[j] + t * (limits[i] - limits[j])
                     sample_poses.append(pose)
 
-        print("Collecting pose data...")
+        self.messages.info("Collecting pose data...")
         collect(sample_poses)
-        print("\n")
+        self.messages.line_break()
 
-        print("Data collection complete\n")
+        self.messages.info("Data collection complete\n")
         return robot_poses, target_poses
 
     def compute_registration(self, robot_poses, target_poses):
@@ -265,16 +262,16 @@ class CameraRegistrationApplication:
         )
 
         if error < 1e-4:
-            print("Registration error ({:.3e}) is within normal range".format(error))
+            self.messages.info("Registration error ({:.3e}) is within normal range".format(error))
         else:
-            print(
+            self.messages.warn(
                 "WARNING: registration error ({:.3e}) is unusually high! Should generally be <0.00005".format(
                     error
                 )
             )
 
         distance = np.linalg.norm(translation)
-        print(
+        self.messages.info(
             "Measured distance from RCM to camera origin: {:.3f} m\n".format(distance)
         )
 
@@ -299,13 +296,13 @@ class CameraRegistrationApplication:
             f.write(output)
             f.write("\n")
 
-        print("Hand-eye calibration saved to {}".format(file_name))
+        self.messages.info("Hand-eye calibration saved to {}".format(file_name))
 
     # Exit key (q/ESCAPE) handler for GUI
     def _on_quit(self):
         self.ok = False
         self.tracker.stop()
-        print("\nExiting...")
+        self.messages.info("\nExiting...")
 
     # Enter (or 'd') handler for GUI
     def _on_enter(self):
@@ -316,8 +313,9 @@ class CameraRegistrationApplication:
             self.marker_size, cv2.aruco.DICT_4X4_50, [0]
         )
         parameters = vision_tracking.VisionTracker.Parameters(4)
+        self.messages = vision_tracking.MessageManager()
         self.tracker = vision_tracking.VisionTracker(
-            target_type, self.camera, parameters
+            target_type, self.messages, self.camera, parameters
         )
 
     def run(self):
@@ -346,8 +344,8 @@ class CameraRegistrationApplication:
                 return
 
             if len(data[0]) <= 10:
-                print("Not enough pose data, cannot compute registration")
-                print("Please try again, with more range of motion within camera view")
+                self.messages.error("Not enough pose data, cannot compute registration")
+                self.messages.error("Please try again, with more range of motion within camera view")
                 return
 
             ok, rvec, tvec = self.compute_registration(*data)
