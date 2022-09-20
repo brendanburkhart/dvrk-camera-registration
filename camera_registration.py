@@ -257,7 +257,7 @@ class CameraRegistrationApplication:
         return robot_poses, target_poses
 
     def compute_registration(self, robot_poses, target_poses):
-        error, rotation, translation = self.camera.calibrate_pose(
+        error, rotation, translation, gripper = self.camera.calibrate_pose(
             robot_poses, target_poses
         )
 
@@ -275,10 +275,10 @@ class CameraRegistrationApplication:
             "Measured distance from RCM to camera origin: {:.3f} m\n".format(distance)
         )
 
-        return self.ok, rotation, translation
+        return self.ok, rotation, translation, gripper
 
     def save_registration(self, rotation, translation, file_name):
-        rotation = np.linalg.inv(rotation)
+        rotation = rotation.T
         translation = -np.matmul(rotation, translation)
 
         transform = np.eye(4)
@@ -348,7 +348,7 @@ class CameraRegistrationApplication:
                 self.messages.error("Please try again, with more range of motion within camera view")
                 return
 
-            ok, rvec, tvec = self.compute_registration(*data)
+            ok, rvec, tvec, g = self.compute_registration(*data)
             if not ok:
                 return
 
